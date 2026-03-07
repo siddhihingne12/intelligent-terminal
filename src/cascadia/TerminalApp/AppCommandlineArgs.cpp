@@ -73,21 +73,11 @@ int AppCommandlineArgs::ParseCommand(const Commandline& command)
         _app.parse(args);
         auto remainingParams = _app.remaining_size();
 
-        // If --agent was provided, create an OpenAgentPane action.
-        if (!_agentPrompt.empty())
-        {
-            OutputDebugStringW(fmt::format(FMT_COMPILE(L"[wt --agent] Prompt: '{}'\n"),
-                                           winrt::to_hstring(_agentPrompt)).c_str());
-            ActionAndArgs agentAction{};
-            agentAction.Action(ShortcutAction::OpenAgentPane);
-            OpenAgentPaneArgs agentArgs{};
-            agentArgs.Prompt(winrt::to_hstring(_agentPrompt));
-            agentAction.Args(agentArgs);
-            _startupActions.push_back(agentAction);
-        }
         // If we parsed the commandline, and _no_ subcommands were provided, try
         // parse the remaining suffix as a "new-tab" command.
-        else if (_noCommandsProvided())
+        // Note: --agent flows through _getNewTerminalArgs() naturally,
+        // so no special case is needed here.
+        if (_noCommandsProvided())
         {
             _newTabCommand.subcommand->parse(args);
             remainingParams = _newTabCommand.subcommand->remaining_size();
@@ -766,6 +756,13 @@ NewTerminalArgs AppCommandlineArgs::_getNewTerminalArgs(AppCommandlineArgs::NewT
         inheritEnv = _inheritEnvironment;
     }
     args.ReloadEnvironmentVariables(!inheritEnv);
+
+    // If --agent was provided as a global option, flow it into NewTerminalArgs
+    if (!_agentPrompt.empty())
+    {
+        args.IsAcpAgent(true);
+        args.AgentPrompt(winrt::to_hstring(_agentPrompt));
+    }
 
     return args;
 }

@@ -3795,10 +3795,34 @@ namespace winrt::TerminalApp::implementation
         const auto sessionId = controlSettings.DefaultSettings()->SessionId();
         const auto hasSessionId = sessionId != winrt::guid{};
 
-        auto connection = existingConnection ? existingConnection : _CreateConnectionFromSettings(profile, *controlSettings.DefaultSettings(), hasSessionId);
-        if (existingConnection)
+        TerminalConnection::ITerminalConnection connection{ nullptr };
+        if (newTerminalArgs && newTerminalArgs.IsAcpAgent())
         {
+            // Create an AcpConnection instead of ConPTY when --agent is specified
+            auto agentCliPath = _settings.GlobalSettings().AgentCliPath();
+            if (agentCliPath.empty())
+            {
+                agentCliPath = _DetectAgentCli();
+            }
+
+            auto acpConn = TerminalConnection::AcpConnection{};
+            Windows::Foundation::Collections::ValueSet connSettings;
+            connSettings.Insert(L"agentCliPath", Windows::Foundation::PropertyValue::CreateString(agentCliPath));
+            connSettings.Insert(L"startingDirectory", Windows::Foundation::PropertyValue::CreateString(
+                controlSettings.DefaultSettings()->StartingDirectory()));
+            connSettings.Insert(L"initialPrompt", Windows::Foundation::PropertyValue::CreateString(
+                newTerminalArgs.AgentPrompt()));
+            acpConn.Initialize(connSettings);
+            connection = acpConn;
+        }
+        else if (existingConnection)
+        {
+            connection = existingConnection;
             connection.Resize(controlSettings.DefaultSettings()->InitialRows(), controlSettings.DefaultSettings()->InitialCols());
+        }
+        else
+        {
+            connection = _CreateConnectionFromSettings(profile, *controlSettings.DefaultSettings(), hasSessionId);
         }
 
         TerminalConnection::ITerminalConnection debugConnection{ nullptr };

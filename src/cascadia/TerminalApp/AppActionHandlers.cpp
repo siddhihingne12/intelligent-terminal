@@ -1638,17 +1638,7 @@ namespace winrt::TerminalApp::implementation
                                             const ActionEventArgs& args)
     {
         OutputDebugStringW(L"[AgentPane] _HandleOpenAgentPane called\n");
-        winrt::hstring prompt;
-        if (const auto& actionArgs = args.ActionArgs())
-        {
-            if (const auto& agentArgs = actionArgs.try_as<OpenAgentPaneArgs>())
-            {
-                prompt = agentArgs.Prompt();
-                OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AgentPane] Prompt from args: '{}'\n"),
-                                               std::wstring_view{ prompt }).c_str());
-            }
-        }
-        _OpenOrReuseAgentPane(prompt);
+        _OpenOrReuseAgentPane(L"");
         args.Handled(true);
     }
 }

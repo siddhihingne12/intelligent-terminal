@@ -52,7 +52,6 @@
 #include "SelectCommandArgs.g.h"
 #include "SelectOutputArgs.g.h"
 #include "ColorSelectionArgs.g.h"
-#include "OpenAgentPaneArgs.g.h"
 
 #include "JsonUtils.h"
 #include "HashUtils.h"
@@ -291,10 +290,6 @@ protected:                                                                  \
     X(winrt::Microsoft::Terminal::Core::MatchMode, MatchMode, "matchMode", false, ArgTypeHint::None, winrt::Microsoft::Terminal::Core::MatchMode::None)
 
 ////////////////////////////////////////////////////////////////////////////////
-#define OPEN_AGENT_PANE_ARGS(X) \
-    X(winrt::hstring, Prompt, "prompt", false, ArgTypeHint::None, L"")
-
-////////////////////////////////////////////////////////////////////////////////
 #define NEW_TERMINAL_ARGS(X)                                                                                                          \
     X(winrt::hstring, Commandline, "commandline", false, ArgTypeHint::None, L"")                                                      \
     X(winrt::hstring, StartingDirectory, "startingDirectory", false, ArgTypeHint::FolderPath, L"")                                    \
@@ -305,7 +300,9 @@ protected:                                                                  \
     X(Windows::Foundation::IReference<bool>, SuppressApplicationTitle, "suppressApplicationTitle", false, ArgTypeHint::None, nullptr) \
     X(winrt::hstring, ColorScheme, "colorScheme", args->SchemeName().empty(), ArgTypeHint::ColorScheme, L"")                          \
     X(Windows::Foundation::IReference<bool>, Elevate, "elevate", false, ArgTypeHint::None, nullptr)                                   \
-    X(Windows::Foundation::IReference<bool>, ReloadEnvironmentVariables, "reloadEnvironmentVariables", false, ArgTypeHint::None, nullptr)
+    X(Windows::Foundation::IReference<bool>, ReloadEnvironmentVariables, "reloadEnvironmentVariables", false, ArgTypeHint::None, nullptr) \
+    X(bool, IsAcpAgent, "isAcpAgent", false, ArgTypeHint::None, false)                                                                \
+    X(winrt::hstring, AgentPrompt, "agentPrompt", false, ArgTypeHint::None, L"")
 
 ////////////////////////////////////////////////////////////////////////////////
 #define SPLIT_PANE_ARGS(X)                                                                                 \
@@ -419,7 +416,9 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
                        otherAsUs->_ColorScheme == _ColorScheme &&
                        otherAsUs->_Elevate == _Elevate &&
                        otherAsUs->_ReloadEnvironmentVariables == _ReloadEnvironmentVariables &&
-                       otherAsUs->_ContentId == _ContentId;
+                       otherAsUs->_ContentId == _ContentId &&
+                       otherAsUs->_IsAcpAgent == _IsAcpAgent &&
+                       otherAsUs->_AgentPrompt == _AgentPrompt;
             }
             return false;
         };
@@ -439,6 +438,8 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
             JsonUtils::GetValueForKey(json, ElevateKey, args->_Elevate);
             JsonUtils::GetValueForKey(json, ReloadEnvironmentVariablesKey, args->_ReloadEnvironmentVariables);
             JsonUtils::GetValueForKey(json, ContentKey, args->_ContentId);
+            JsonUtils::GetValueForKey(json, IsAcpAgentKey, args->_IsAcpAgent);
+            JsonUtils::GetValueForKey(json, AgentPromptKey, args->_AgentPrompt);
             return *args;
         }
         static Json::Value ToJson(const Model::NewTerminalArgs& val)
@@ -461,6 +462,8 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
             JsonUtils::SetValueForKey(json, ElevateKey, args->_Elevate);
             JsonUtils::SetValueForKey(json, ReloadEnvironmentVariablesKey, args->_ReloadEnvironmentVariables);
             JsonUtils::SetValueForKey(json, ContentKey, args->_ContentId);
+            JsonUtils::SetValueForKey(json, IsAcpAgentKey, args->_IsAcpAgent);
+            JsonUtils::SetValueForKey(json, AgentPromptKey, args->_AgentPrompt);
             return json;
         }
         Model::NewTerminalArgs Copy() const
@@ -478,6 +481,8 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
             copy->_Elevate = _Elevate;
             copy->_ReloadEnvironmentVariables = _ReloadEnvironmentVariables;
             copy->_ContentId = _ContentId;
+            copy->_IsAcpAgent = _IsAcpAgent;
+            copy->_AgentPrompt = _AgentPrompt;
             return *copy;
         }
         size_t Hash() const
@@ -499,6 +504,8 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
             h.write(Elevate());
             h.write(ReloadEnvironmentVariables());
             h.write(ContentId());
+            h.write(IsAcpAgent());
+            h.write(AgentPrompt());
         }
     };
 
@@ -1042,8 +1049,6 @@ namespace winrt::Microsoft::Terminal::Settings::Model::implementation
 
     ACTION_ARGS_STRUCT(ColorSelectionArgs, COLOR_SELECTION_ARGS);
 
-    ACTION_ARGS_STRUCT(OpenAgentPaneArgs, OPEN_AGENT_PANE_ARGS);
-
 }
 
 namespace winrt::Microsoft::Terminal::Settings::Model::factory_implementation
@@ -1085,7 +1090,6 @@ namespace winrt::Microsoft::Terminal::Settings::Model::factory_implementation
     BASIC_FACTORY(SuggestionsArgs);
     BASIC_FACTORY(SelectCommandArgs);
     BASIC_FACTORY(SelectOutputArgs);
-    BASIC_FACTORY(OpenAgentPaneArgs);
 }
 
 class ScopedResourceLoader;

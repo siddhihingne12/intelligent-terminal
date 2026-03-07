@@ -193,6 +193,9 @@ namespace Microsoft.Terminal.Settings.Model
 
         UInt64 ContentId{ get; set; };
 
+        Boolean IsAcpAgent;
+        String AgentPrompt;
+
         String ToCommandline();
     };
 
@@ -482,12 +485,5 @@ namespace Microsoft.Terminal.Settings.Model
         SelectOutputArgs(SelectOutputDirection direction);
         SelectOutputDirection Direction { get; };
     }
-
-    [default_interface] runtimeclass OpenAgentPaneArgs : IActionArgs, IActionArgsDescriptorAccess
-    {
-        OpenAgentPaneArgs();
-
-        String Prompt;
-    };
 
 }

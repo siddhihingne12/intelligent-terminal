@@ -258,7 +258,7 @@ impl ShellManager {
             .await?;
 
         let data = output_result
-            .get("output")
+            .get("content")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
@@ -341,8 +341,9 @@ impl ShellManager {
 
             // Check if the process is still running
             let is_running = result
-                .get("is_running")
-                .and_then(|v| v.as_bool())
+                .get("state")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "running")
                 .unwrap_or(true);
 
             if !is_running {

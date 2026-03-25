@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, Context};
 use tokio::sync::mpsc;
-use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface};
+use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR};
+use windows::Win32::Foundation::SysAllocString;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSIDFromString, CoTaskMemFree,
     CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED,
@@ -87,6 +88,17 @@ pub struct ProtocolTabCreationResult {
 // ============================================================================
 // BSTR helpers
 // ============================================================================
+
+/// Create a BSTR from a Rust &str via SysAllocString. Returns the raw pointer.
+/// The caller must free with bstr_free() or BSTR::from_raw().
+/// Returns null for empty strings (matches COM convention).
+unsafe fn bstr_alloc(s: &str) -> *const u16 {
+    if s.is_empty() {
+        return std::ptr::null();
+    }
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    SysAllocString(PCWSTR(wide.as_ptr())).as_ptr()
+}
 
 /// Read a BSTR pointer into a Rust String, then free it.
 unsafe fn bstr_to_string_free(ptr: *mut u16) -> String {
@@ -244,13 +256,15 @@ impl ProtocolServerProxy {
 
     // ── Typed method wrappers ──
 
-    unsafe fn authenticate_raw(&self, token_ptr: *const u16) -> anyhow::Result<(bool, String)> {
+    unsafe fn authenticate(&self, token: &str) -> anyhow::Result<(bool, String)> {
         let vt = self.vtbl();
+        let token_bstr = bstr_alloc(token);
         let mut authenticated: i32 = 0;
         let mut version_ptr: *mut u16 = std::ptr::null_mut();
 
-        (vt.Authenticate)(self.ptr, token_ptr, &mut authenticated, &mut version_ptr)
-            .ok().context("Authenticate failed")?;
+        let hr = (vt.Authenticate)(self.ptr, token_bstr, &mut authenticated, &mut version_ptr);
+        bstr_free(token_bstr as *mut u16);
+        hr.ok().context("Authenticate failed")?;
 
         let version = bstr_to_string_free(version_ptr);
         Ok((authenticated != 0, version))
@@ -281,12 +295,13 @@ impl ProtocolServerProxy {
 
     unsafe fn list_tabs(&self, window_id: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let filter = BSTR::from(window_id);
+        let filter = bstr_alloc(window_id);
         let mut count: u32 = 0;
         let mut results: *mut ProtocolTabInfo = std::ptr::null_mut();
 
-        (vt.ListTabs)(self.ptr, filter.as_ptr(), &mut count, &mut results)
-            .ok().context("ListTabs failed")?;
+        let hr = (vt.ListTabs)(self.ptr, filter, &mut count, &mut results);
+        bstr_free(filter as *mut u16);
+        hr.ok().context("ListTabs failed")?;
 
         let mut tabs = Vec::new();
         for i in 0..count as usize {
@@ -306,13 +321,16 @@ impl ProtocolServerProxy {
 
     unsafe fn list_panes(&self, window_id: &str, tab_id: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let wf = BSTR::from(window_id);
-        let tf = BSTR::from(tab_id);
+        let wf = bstr_alloc(window_id);
+        let tf = bstr_alloc(tab_id);
         let mut count: u32 = 0;
         let mut results: *mut ProtocolPaneInfo = std::ptr::null_mut();
 
-        (vt.ListPanes)(self.ptr, wf.as_ptr(), tf.as_ptr(), &mut count, &mut results)
-            .ok().context("ListPanes failed")?;
+        let hr = (vt.ListPanes)(self.ptr, wf, tf, &mut count, &mut results);
+        // Free the BSTRs we allocated
+        bstr_free(wf as *mut u16);
+        bstr_free(tf as *mut u16);
+        hr.ok().context("ListPanes failed")?;
 
         let mut panes = Vec::new();
         for i in 0..count as usize {
@@ -357,12 +375,14 @@ impl ProtocolServerProxy {
 
     unsafe fn read_pane_output(&self, pane_id: &str, source: &str, max_lines: i32) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pid = BSTR::from(pane_id);
-        let src = BSTR::from(source);
+        let pid = bstr_alloc(pane_id);
+        let src = bstr_alloc(source);
         let mut out: ProtocolPaneOutput = std::mem::zeroed();
 
-        (vt.ReadPaneOutput)(self.ptr, pid.as_ptr(), src.as_ptr(), max_lines, &mut out)
-            .ok().context("ReadPaneOutput failed")?;
+        let hr = (vt.ReadPaneOutput)(self.ptr, pid, src, max_lines, &mut out);
+        bstr_free(pid as *mut u16);
+        bstr_free(src as *mut u16);
+        hr.ok().context("ReadPaneOutput failed")?;
 
         let result = serde_json::json!({
             "pane_id": bstr_to_string(out.pane_id),
@@ -376,11 +396,12 @@ impl ProtocolServerProxy {
 
     unsafe fn get_process_status(&self, pane_id: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pid = BSTR::from(pane_id);
+        let pid = bstr_alloc(pane_id);
         let mut out: ProtocolProcessStatus = std::mem::zeroed();
 
-        (vt.GetProcessStatus)(self.ptr, pid.as_ptr(), &mut out)
-            .ok().context("GetProcessStatus failed")?;
+        let hr = (vt.GetProcessStatus)(self.ptr, pid, &mut out);
+        bstr_free(pid as *mut u16);
+        hr.ok().context("GetProcessStatus failed")?;
 
         let mut result = serde_json::json!({
             "pane_id": bstr_to_string(out.pane_id),
@@ -396,12 +417,14 @@ impl ProtocolServerProxy {
 
     unsafe fn get_session_variable(&self, pane_id: &str, name: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pid = BSTR::from(pane_id);
-        let n = BSTR::from(name);
+        let pid = bstr_alloc(pane_id);
+        let n = bstr_alloc(name);
         let mut out: ProtocolSessionVariable = std::mem::zeroed();
 
-        (vt.GetSessionVariable)(self.ptr, pid.as_ptr(), n.as_ptr(), &mut out)
-            .ok().context("GetSessionVariable failed")?;
+        let hr = (vt.GetSessionVariable)(self.ptr, pid, n, &mut out);
+        bstr_free(pid as *mut u16);
+        bstr_free(n as *mut u16);
+        hr.ok().context("GetSessionVariable failed")?;
 
         let result = serde_json::json!({
             "pane_id": bstr_to_string(out.pane_id),
@@ -426,18 +449,20 @@ impl ProtocolServerProxy {
 
     unsafe fn create_tab(&self, params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let window_id = BSTR::from(params.get("window_id").and_then(|v| v.as_str()).unwrap_or(""));
-        let profile = BSTR::from(params.get("profile").and_then(|v| v.as_str()).unwrap_or(""));
-        let commandline = BSTR::from(params.get("commandline").and_then(|v| v.as_str()).unwrap_or(""));
-        let title = BSTR::from(params.get("title").and_then(|v| v.as_str()).unwrap_or(""));
+        let window_id = bstr_alloc(params.get("window_id").and_then(|v| v.as_str()).unwrap_or(""));
+        let profile = bstr_alloc(params.get("profile").and_then(|v| v.as_str()).unwrap_or(""));
+        let commandline = bstr_alloc(params.get("commandline").and_then(|v| v.as_str()).unwrap_or(""));
+        let title = bstr_alloc(params.get("title").and_then(|v| v.as_str()).unwrap_or(""));
         let suppress = if params.get("suppress_application_title").and_then(|v| v.as_bool()).unwrap_or(false) { 1i32 } else { 0 };
         let inject = if params.get("inject_mcp_credentials").and_then(|v| v.as_bool()).unwrap_or(false) { 1i32 } else { 0 };
         let bg = if params.get("background").and_then(|v| v.as_bool()).unwrap_or(true) { 1i32 } else { 0 };
         let mut out: ProtocolTabCreationResult = std::mem::zeroed();
 
-        (vt.CreateTab)(self.ptr, window_id.as_ptr(), profile.as_ptr(), commandline.as_ptr(),
-                       title.as_ptr(), suppress, inject, bg, &mut out)
-            .ok().context("CreateTab failed")?;
+        let hr = (vt.CreateTab)(self.ptr, window_id, profile, commandline,
+                       title, suppress, inject, bg, &mut out);
+        bstr_free(window_id as *mut u16); bstr_free(profile as *mut u16);
+        bstr_free(commandline as *mut u16); bstr_free(title as *mut u16);
+        hr.ok().context("CreateTab failed")?;
 
         let result = serde_json::json!({
             "tab_id": bstr_to_string(out.tab_id),
@@ -451,18 +476,20 @@ impl ProtocolServerProxy {
 
     unsafe fn split_pane(&self, params: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pane_id = BSTR::from(params.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
-        let direction = BSTR::from(params.get("direction").and_then(|v| v.as_str()).unwrap_or("right"));
+        let pane_id = bstr_alloc(params.get("pane_id").and_then(|v| v.as_str()).unwrap_or(""));
+        let direction = bstr_alloc(params.get("direction").and_then(|v| v.as_str()).unwrap_or("right"));
         let size = params.get("size").and_then(|v| v.as_f64()).unwrap_or(0.5) as f32;
-        let profile = BSTR::from(params.get("profile").and_then(|v| v.as_str()).unwrap_or(""));
-        let commandline = BSTR::from(params.get("commandline").and_then(|v| v.as_str()).unwrap_or(""));
+        let profile = bstr_alloc(params.get("profile").and_then(|v| v.as_str()).unwrap_or(""));
+        let commandline = bstr_alloc(params.get("commandline").and_then(|v| v.as_str()).unwrap_or(""));
         let inject = if params.get("inject_mcp_credentials").and_then(|v| v.as_bool()).unwrap_or(false) { 1i32 } else { 0 };
         let bg = if params.get("background").and_then(|v| v.as_bool()).unwrap_or(true) { 1i32 } else { 0 };
         let mut out: ProtocolTabCreationResult = std::mem::zeroed();
 
-        (vt.SplitPane)(self.ptr, pane_id.as_ptr(), direction.as_ptr(), size,
-                       profile.as_ptr(), commandline.as_ptr(), inject, bg, &mut out)
-            .ok().context("SplitPane failed")?;
+        let hr = (vt.SplitPane)(self.ptr, pane_id, direction, size,
+                       profile, commandline, inject, bg, &mut out);
+        bstr_free(pane_id as *mut u16); bstr_free(direction as *mut u16);
+        bstr_free(profile as *mut u16); bstr_free(commandline as *mut u16);
+        hr.ok().context("SplitPane failed")?;
 
         let result = serde_json::json!({
             "tab_id": bstr_to_string(out.tab_id),
@@ -476,37 +503,44 @@ impl ProtocolServerProxy {
 
     unsafe fn close_pane(&self, pane_id: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pid = BSTR::from(pane_id);
-        (vt.ClosePane)(self.ptr, pid.as_ptr())
-            .ok().context("ClosePane failed")?;
+        let pid = bstr_alloc(pane_id);
+        let hr = (vt.ClosePane)(self.ptr, pid);
+        bstr_free(pid as *mut u16);
+        hr.ok().context("ClosePane failed")?;
         Ok(serde_json::json!({ "closed": true }))
     }
 
     unsafe fn send_input(&self, pane_id: &str, text: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pid = BSTR::from(pane_id);
-        let t = BSTR::from(text);
-        (vt.SendInput)(self.ptr, pid.as_ptr(), t.as_ptr())
-            .ok().context("SendInput failed")?;
+        let pid = bstr_alloc(pane_id);
+        let t = bstr_alloc(text);
+        let hr = (vt.SendInput)(self.ptr, pid, t);
+        bstr_free(pid as *mut u16);
+        bstr_free(t as *mut u16);
+        hr.ok().context("SendInput failed")?;
         Ok(serde_json::json!({ "sent": true }))
     }
 
     unsafe fn set_session_variable(&self, pane_id: &str, name: &str, value: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let pid = BSTR::from(pane_id);
-        let n = BSTR::from(name);
-        let v = BSTR::from(value);
-        (vt.SetSessionVariable)(self.ptr, pid.as_ptr(), n.as_ptr(), v.as_ptr())
-            .ok().context("SetSessionVariable failed")?;
+        let pid = bstr_alloc(pane_id);
+        let n = bstr_alloc(name);
+        let v = bstr_alloc(value);
+        let hr = (vt.SetSessionVariable)(self.ptr, pid, n, v);
+        bstr_free(pid as *mut u16);
+        bstr_free(n as *mut u16);
+        bstr_free(v as *mut u16);
+        hr.ok().context("SetSessionVariable failed")?;
         Ok(serde_json::json!({ "set": true }))
     }
 
     unsafe fn set_settings(&self, content: &str) -> anyhow::Result<serde_json::Value> {
         let vt = self.vtbl();
-        let c = BSTR::from(content);
+        let c = bstr_alloc(content);
         let mut backup_ptr: *mut u16 = std::ptr::null_mut();
-        (vt.SetSettings)(self.ptr, c.as_ptr(), &mut backup_ptr)
-            .ok().context("SetSettings failed")?;
+        let hr = (vt.SetSettings)(self.ptr, c, &mut backup_ptr);
+        bstr_free(c as *mut u16);
+        hr.ok().context("SetSettings failed")?;
         let backup = bstr_to_string_free(backup_ptr);
         Ok(serde_json::json!({ "applied": true, "backup_path": backup }))
     }
@@ -566,17 +600,7 @@ impl ComChannel {
             }
         }).await??;
 
-        // Authenticate using the typed Authenticate method.
-        // Pass null BSTR for empty token (dev bypass); non-null BSTRs have a known
-        // marshaling issue with the Authenticate proxy that needs investigation.
-        let token_ptr = if token.is_empty() {
-            std::ptr::null()
-        } else {
-            // TODO: investigate why non-null BSTR crashes the Authenticate proxy
-            // For now, fall back to HandleRequest JSON for non-empty tokens
-            std::ptr::null() // treat as empty for now
-        };
-        let (authenticated, _version) = unsafe { server.authenticate_raw(token_ptr)? };
+        let (authenticated, _version) = unsafe { server.authenticate(&token)? };
         if !authenticated {
             bail!("Authentication rejected by Windows Terminal");
         }
@@ -617,8 +641,8 @@ impl WtChannel for ComChannel {
         let result = unsafe {
             match method {
                 "authenticate" => {
-                    // Use null BSTR for empty token (dev bypass); see TODO on non-null BSTR issue
-                    let (auth, version) = self.server.authenticate_raw(std::ptr::null())?;
+                    let token = params.get("token").and_then(|v| v.as_str()).unwrap_or("");
+                    let (auth, version) = self.server.authenticate(token)?;
                     serde_json::json!({ "authenticated": auth, "protocol_version": version })
                 }
                 "get_capabilities" => {

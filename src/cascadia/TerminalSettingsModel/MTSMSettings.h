@@ -73,6 +73,7 @@ Author(s):
     X(hstring, SearchWebDefaultQueryUrl, "searchWebDefaultQueryUrl", L"https://www.bing.com/search?q=%22%s%22")                                                                                       \
     X(bool, ShowTabsFullscreen, "showTabsFullscreen", false)                                                                                                                                            \
     X(hstring, AgentCliPath, "agentCliPath", L"")                                                                                                                                                       \
+    X(hstring, DelegateAgentCliPath, "delegateAgentCliPath", L"")                                                                                                                                       \
     X(hstring, AgentPanePosition, "agentPanePosition", L"bottom")                                                                                                                                       \
     X(bool, AiCoordinatorEnabled, "aiIntegration.coordinator.enabled", false)                                                                                                                          \
     X(hstring, AiCoordinatorCommandline, "aiIntegration.coordinator.commandline", L"wta")                                                                                                                     \

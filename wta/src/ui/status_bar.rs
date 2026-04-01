@@ -5,15 +5,22 @@ use crate::app::{App, ConnectionState};
 use crate::theme;
 
 fn agent_identity(app: &App) -> String {
-    let name = if app.agent_name.is_empty() {
+    let agent_name = if app.agent_name.is_empty() {
         "agent"
     } else {
         &app.agent_name
     };
 
-    match app.agent_model.as_deref() {
-        Some(model) if !model.is_empty() => format!("{} {}", name, model),
-        _ => name.to_string(),
+    let agent_identity = match app.agent_model.as_deref() {
+        Some(model) if !model.is_empty() => format!("{} {}", agent_name, model),
+        _ => agent_name.to_string(),
+    };
+
+    match app.prompt_name.as_deref() {
+        Some(prompt_name) if !prompt_name.is_empty() => {
+            format!("{} · {}", agent_identity, prompt_name)
+        }
+        _ => agent_identity,
     }
 }
 

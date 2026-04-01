@@ -20,7 +20,7 @@
   <Identity
     Name="Microsoft.WindowsTerminalCanary"
     Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
-    Version="0.0.1.0" />
+    Version="0.0.2.1" />
 
   <Properties>
     <DisplayName>ms-resource:AppStoreNameCan</DisplayName>

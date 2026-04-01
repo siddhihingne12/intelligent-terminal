@@ -24,7 +24,7 @@ fn mcp_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("wta-mcp-debug.log")
+        .open(crate::runtime_paths::runtime_log_path("wta-mcp-debug.log"))
     {
         let elapsed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

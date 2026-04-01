@@ -20,7 +20,7 @@ pub fn log(message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("wta-ui-debug.log")
+        .open(crate::runtime_paths::runtime_log_path("wta-ui-debug.log"))
     {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)

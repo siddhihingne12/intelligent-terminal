@@ -10,7 +10,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::coordinator::{
-    parse_recommendation_set, recommended_choice_index, RecommendationChoice, RecommendationSet,
+    parse_recommendation_set, recommended_choice_index,
+    validate_recommendation_set_for_coordinator_target, RecommendationChoice, RecommendationSet,
 };
 use crate::protocol::acp::client::{prompt_timing_log, PromptSubmission};
 use crate::shared_host::SharedStateSnapshot;
@@ -57,6 +58,13 @@ pub enum ChatMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompletedTurn {
+    pub prompt: String,
+    #[serde(default)]
+    pub details: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanEntry {
     pub content: String,
     pub status: PlanEntryStatus,
@@ -83,6 +91,11 @@ pub struct PermissionState {
     pub responder: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
+enum FinalizeOutcome {
+    None,
+    SelectionReady,
+}
+
 // --- Events ---
 
 pub enum AppEvent {
@@ -97,7 +110,11 @@ pub enum AppEvent {
         model: Option<String>,
         session_id: String,
     },
+    PromptTemplateLoaded {
+        name: String,
+    },
     AgentError(String),
+    ExecutionInfo(String),
     AgentThoughtChunk(String),
     AgentMessageChunk(String),
     AgentMessageEnd,
@@ -133,11 +150,15 @@ pub struct App {
     pub state: ConnectionState,
     pub agent_name: String,
     pub agent_model: Option<String>,
+    pub prompt_name: Option<String>,
     pub progress_status: Option<String>,
     pub activity_frame: usize,
     pub session_id: String,
     pub wt_connected: bool,
     pub messages: Vec<ChatMessage>,
+    pub completed_turns: Vec<CompletedTurn>,
+    pub selected_history: Option<usize>,
+    pub expanded_history: Option<usize>,
     pub input: String,
     pub cursor_pos: usize,
     pub tool_calls: HashMap<String, (String, String)>, // id -> (title, status)
@@ -167,6 +188,8 @@ pub struct App {
     pub pane_id: Option<String>,
     pub tab_id: Option<String>,
     pub window_id: Option<String>,
+    current_prompt_text: Option<String>,
+    pending_completed_turn: Option<CompletedTurn>,
 }
 
 impl App {
@@ -182,11 +205,15 @@ impl App {
             state: ConnectionState::Connecting("Starting agent...".to_string()),
             agent_name: String::new(),
             agent_model: None,
+            prompt_name: None,
             progress_status: None,
             activity_frame: 0,
             session_id: String::new(),
             wt_connected,
             messages: Vec::new(),
+            completed_turns: Vec::new(),
+            selected_history: None,
+            expanded_history: None,
             input: String::new(),
             cursor_pos: 0,
             tool_calls: HashMap::new(),
@@ -214,6 +241,8 @@ impl App {
             pane_id: None,
             tab_id: None,
             window_id: None,
+            current_prompt_text: None,
+            pending_completed_turn: None,
         }
     }
 
@@ -389,7 +418,9 @@ impl App {
             AppEvent::ProgressStatus(_) => "progress_status",
             AppEvent::UserMessage(_) => "user_message",
             AppEvent::AgentConnected { .. } => "agent_connected",
+            AppEvent::PromptTemplateLoaded { .. } => "prompt_template_loaded",
             AppEvent::AgentError(_) => "agent_error",
+            AppEvent::ExecutionInfo(_) => "execution_info",
             AppEvent::AgentThoughtChunk(_) => "agent_thought_chunk",
             AppEvent::AgentMessageChunk(_) => "agent_message_chunk",
             AppEvent::AgentMessageEnd => "agent_message_end",
@@ -408,9 +439,10 @@ impl App {
 
     fn trace_state(&self) -> String {
         format!(
-            "state={:?} messages={} input_chars={} thought_chars={} pending_chars={} scroll={} streaming={} activity_frame={} recommendations={} permission={} timing_note={}",
+            "state={:?} messages={} completed_turns={} input_chars={} thought_chars={} pending_chars={} scroll={} streaming={} activity_frame={} recommendations={} permission={} timing_note={}",
             self.state,
             self.messages.len(),
+            self.completed_turns.len(),
             self.input.chars().count(),
             self.pending_thought_response.chars().count(),
             self.pending_agent_response.chars().count(),
@@ -443,7 +475,7 @@ impl App {
                 self.scroll_to_bottom();
             }
             AppEvent::UserMessage(text) => {
-                self.prepare_for_new_prompt();
+                self.prepare_for_new_prompt(&text);
                 self.messages.push(ChatMessage::User(text));
                 self.scroll_to_bottom();
             }
@@ -457,6 +489,9 @@ impl App {
                 self.session_id = session_id;
                 self.state = ConnectionState::Connected;
             }
+            AppEvent::PromptTemplateLoaded { name } => {
+                self.prompt_name = Some(name);
+            }
             AppEvent::AgentError(msg) => {
                 self.state = ConnectionState::Failed(msg.clone());
                 self.prompt_in_flight = false;
@@ -466,7 +501,12 @@ impl App {
                 self.activity_frame = 0;
                 self.pending_agent_response.clear();
                 self.timing_note = None;
+                self.pending_completed_turn = None;
                 self.messages.push(ChatMessage::Error(msg));
+            }
+            AppEvent::ExecutionInfo(message) => {
+                self.push_execution_info(message);
+                self.scroll_to_bottom();
             }
             AppEvent::AgentThoughtChunk(text) => {
                 self.prompt_in_flight = true;
@@ -490,11 +530,16 @@ impl App {
                 self.progress_status = None;
                 self.pending_thought_response.clear();
                 self.activity_frame = 0;
-                let parsed_recommendations = self.finalize_agent_response();
-                if parsed_recommendations {
-                    self.clear_completed_turn_history();
-                } else {
-                    self.scroll_to_bottom();
+                if let Some(summary) = self.completion_latency_summary() {
+                    self.push_execution_info(summary);
+                }
+                match self.finalize_agent_response() {
+                    FinalizeOutcome::SelectionReady => {
+                        self.clear_completed_turn_history();
+                    }
+                    FinalizeOutcome::None => {
+                        self.scroll_to_bottom();
+                    }
                 }
             }
             AppEvent::TimingMetric(note) => {
@@ -650,6 +695,12 @@ impl App {
                     }
                 }
             }
+            KeyCode::Up if self.history_navigation_enabled() => {
+                self.select_previous_history_turn();
+            }
+            KeyCode::Down if self.history_navigation_enabled() => {
+                self.select_next_history_turn();
+            }
             KeyCode::F(12) => {
                 self.show_debug_panel = !self.show_debug_panel;
                 self.debug_capture_enabled
@@ -677,21 +728,28 @@ impl App {
                     self.should_quit = true;
                 }
             }
+            KeyCode::Esc if self.input.is_empty() => {
+                self.collapse_selected_history_turn();
+            }
             KeyCode::Enter => {
                 if self.input.is_empty()
                     && self.state == ConnectionState::Connected
                     && self.recommendations.is_some()
                 {
                     if let Some(choice) = self.selected_recommendation().cloned() {
+                        self.commit_pending_completed_turn();
                         self.clear_recommendations();
+                        self.push_execution_info(format!("Executing choice {}.", choice.choice));
                         let _ = self.recommendation_tx.send(choice);
                     }
+                } else if self.history_navigation_enabled() {
+                    self.toggle_selected_history_turn();
                 } else if !self.input.is_empty() && self.state == ConnectionState::Connected {
                     let text = self.input.clone();
                     self.input.clear();
                     self.cursor_pos = 0;
                     if !self.shared_mode {
-                        self.prepare_for_new_prompt();
+                        self.prepare_for_new_prompt(&text);
                         self.messages.push(ChatMessage::User(text.clone()));
                         self.scroll_to_bottom();
                     }
@@ -709,25 +767,16 @@ impl App {
                 }
             }
             KeyCode::Backspace => {
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                    self.input.remove(self.cursor_pos);
-                }
+                self.delete_before_cursor();
             }
             KeyCode::Delete => {
-                if self.cursor_pos < self.input.len() {
-                    self.input.remove(self.cursor_pos);
-                }
+                self.delete_at_cursor();
             }
             KeyCode::Left => {
-                if self.cursor_pos > 0 {
-                    self.cursor_pos -= 1;
-                }
+                self.move_cursor_left();
             }
             KeyCode::Right => {
-                if self.cursor_pos < self.input.len() {
-                    self.cursor_pos += 1;
-                }
+                self.move_cursor_right();
             }
             KeyCode::Home => {
                 self.cursor_pos = 0;
@@ -742,8 +791,7 @@ impl App {
                 self.scroll_offset = self.scroll_offset.saturating_sub(10);
             }
             KeyCode::Char(c) => {
-                self.input.insert(self.cursor_pos, c);
-                self.cursor_pos += 1;
+                self.insert_input_char(c);
             }
             _ => {}
         }
@@ -757,9 +805,64 @@ impl App {
         self.prompt_in_flight || self.agent_streaming || self.progress_status.is_some()
     }
 
+    fn insert_input_char(&mut self, ch: char) {
+        self.cursor_pos = clamp_cursor_to_boundary(&self.input, self.cursor_pos);
+        self.input.insert(self.cursor_pos, ch);
+        self.cursor_pos += ch.len_utf8();
+    }
+
+    fn delete_before_cursor(&mut self) {
+        self.cursor_pos = clamp_cursor_to_boundary(&self.input, self.cursor_pos);
+        if self.cursor_pos == 0 {
+            return;
+        }
+
+        let previous = prev_char_boundary(&self.input, self.cursor_pos);
+        self.input.replace_range(previous..self.cursor_pos, "");
+        self.cursor_pos = previous;
+    }
+
+    fn delete_at_cursor(&mut self) {
+        self.cursor_pos = clamp_cursor_to_boundary(&self.input, self.cursor_pos);
+        if self.cursor_pos >= self.input.len() {
+            return;
+        }
+
+        let next = next_char_boundary(&self.input, self.cursor_pos);
+        self.input.replace_range(self.cursor_pos..next, "");
+    }
+
+    fn move_cursor_left(&mut self) {
+        self.cursor_pos = prev_char_boundary(&self.input, self.cursor_pos);
+    }
+
+    fn move_cursor_right(&mut self) {
+        self.cursor_pos = next_char_boundary(&self.input, self.cursor_pos);
+    }
+
     fn clear_recommendations(&mut self) {
         self.recommendations = None;
         self.selected_recommendation = 0;
+    }
+
+    pub fn history_navigation_enabled(&self) -> bool {
+        self.input.is_empty()
+            && self.recommendations.is_none()
+            && self.permission.is_none()
+            && !self.prompt_in_flight
+            && !self.agent_streaming
+            && self.messages.is_empty()
+            && self.pending_agent_response.is_empty()
+            && self.pending_thought_response.is_empty()
+            && !self.completed_turns.is_empty()
+    }
+
+    pub fn history_row_selected(&self, index: usize) -> bool {
+        self.selected_history == Some(index)
+    }
+
+    pub fn history_row_expanded(&self, index: usize) -> bool {
+        self.expanded_history == Some(index)
     }
 
     fn clear_chat_history(&mut self) {
@@ -774,6 +877,9 @@ impl App {
         self.scroll_offset = 0;
         self.timing_note = None;
         self.selection_visible_pending = false;
+        self.current_prompt_text = None;
+        self.current_prompt_submitted_at_unix_s = None;
+        self.pending_completed_turn = None;
         self.clear_recommendations();
     }
 
@@ -788,13 +894,137 @@ impl App {
         self.agent_streaming = false;
         self.scroll_offset = 0;
         self.selection_visible_pending = false;
+        self.current_prompt_text = None;
+        self.current_prompt_submitted_at_unix_s = None;
     }
 
-    fn prepare_for_new_prompt(&mut self) {
+    fn completion_latency_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+
+        if let Some(submitted_at) = self.current_prompt_submitted_at_unix_s {
+            let total_s = (now_unix_s() - submitted_at).max(0.0);
+            parts.push(format!("total {:.3}s", total_s));
+        }
+
+        if let Some(note) = self.timing_note.as_deref().filter(|note| !note.is_empty()) {
+            parts.push(note.to_string());
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!("Latency: {}", parts.join(" | ")))
+        }
+    }
+
+    fn prepare_for_new_prompt(&mut self, prompt_text: &str) {
         self.clear_chat_history();
+        self.current_prompt_text = Some(prompt_text.to_string());
         self.prompt_in_flight = true;
         self.progress_status = Some("Preparing context...".to_string());
         self.activity_frame = 0;
+    }
+
+    fn push_execution_info(&mut self, message: String) {
+        if let Some(turn) = self.completed_turns.last_mut() {
+            turn.details.push(ChatMessage::System(message));
+        } else {
+            self.messages.push(ChatMessage::System(message));
+        }
+    }
+
+    fn current_turn_details(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter(|message| !matches!(message, ChatMessage::User(_)))
+            .cloned()
+            .collect()
+    }
+
+    fn stage_completed_turn(&mut self, agent_text: String) {
+        let Some(prompt) = self.current_prompt_text.clone() else {
+            self.pending_completed_turn = None;
+            return;
+        };
+
+        let mut details = self.current_turn_details();
+        details.push(ChatMessage::Agent(agent_text));
+        self.pending_completed_turn = Some(CompletedTurn { prompt, details });
+    }
+
+    fn commit_pending_completed_turn(&mut self) {
+        let Some(turn) = self.pending_completed_turn.take() else {
+            return;
+        };
+
+        self.completed_turns.push(turn);
+        self.focus_latest_completed_turn();
+    }
+
+    fn focus_latest_completed_turn(&mut self) {
+        let Some(last) = self.completed_turns.len().checked_sub(1) else {
+            self.selected_history = None;
+            self.expanded_history = None;
+            return;
+        };
+
+        self.selected_history = Some(last);
+        self.expanded_history = None;
+        self.scroll_to_bottom();
+    }
+
+    fn select_previous_history_turn(&mut self) {
+        let Some(selected) = self.selected_history else {
+            self.selected_history = Some(self.completed_turns.len().saturating_sub(1));
+            return;
+        };
+
+        if selected > 0 {
+            self.selected_history = Some(selected - 1);
+        }
+    }
+
+    fn select_next_history_turn(&mut self) {
+        let Some(selected) = self.selected_history else {
+            self.selected_history = Some(self.completed_turns.len().saturating_sub(1));
+            return;
+        };
+
+        if selected + 1 < self.completed_turns.len() {
+            self.selected_history = Some(selected + 1);
+        }
+    }
+
+    fn toggle_selected_history_turn(&mut self) {
+        let Some(selected) = self.selected_history else {
+            return;
+        };
+
+        if self.expanded_history == Some(selected) {
+            self.expanded_history = None;
+        } else {
+            self.expanded_history = Some(selected);
+        }
+    }
+
+    fn collapse_selected_history_turn(&mut self) {
+        if self.expanded_history == self.selected_history {
+            self.expanded_history = None;
+        }
+    }
+
+    fn normalize_history_state(&mut self) {
+        if self.completed_turns.is_empty() {
+            self.selected_history = None;
+            self.expanded_history = None;
+            return;
+        }
+
+        let last = self.completed_turns.len() - 1;
+        self.selected_history = Some(self.selected_history.unwrap_or(last).min(last));
+        if let Some(expanded) = self.expanded_history {
+            self.expanded_history = Some(expanded.min(last));
+        }
     }
 
     fn selected_recommendation(&self) -> Option<&RecommendationChoice> {
@@ -803,16 +1033,23 @@ impl App {
             .and_then(|recs| recs.choices.get(self.selected_recommendation))
     }
 
-    fn finalize_agent_response(&mut self) -> bool {
+    fn finalize_agent_response(&mut self) -> FinalizeOutcome {
         if self.pending_agent_response.trim().is_empty() {
             self.log_selection_phase("selection_parse_failed", "reason=empty_agent_response");
-            return false;
+            return FinalizeOutcome::None;
         }
 
         let text = std::mem::take(&mut self.pending_agent_response);
 
-        match parse_recommendation_set(&text) {
+        match parse_recommendation_set(&text).and_then(|recommendations| {
+            validate_recommendation_set_for_coordinator_target(
+                &recommendations,
+                self.pane_id.as_deref(),
+            )?;
+            Ok(recommendations)
+        }) {
             Ok(recommendations) => {
+                self.stage_completed_turn(text);
                 self.selected_recommendation = recommended_choice_index(&recommendations);
                 self.log_selection_phase(
                     "selection_ready",
@@ -824,10 +1061,11 @@ impl App {
                 );
                 self.recommendations = Some(recommendations);
                 self.selection_visible_pending = true;
-                true
+                FinalizeOutcome::SelectionReady
             }
             Err(err) => {
                 self.clear_recommendations();
+                self.pending_completed_turn = None;
                 let error_text = format!("{:#}", err).replace('\n', " | ");
                 self.log_selection_phase(
                     "selection_parse_failed",
@@ -837,18 +1075,17 @@ impl App {
                         error_text
                     ),
                 );
-                self.messages.push(ChatMessage::System(format!(
-                    "Agent returned invalid recommendation JSON: {}",
-                    error_text
-                )));
-                self.messages.push(ChatMessage::Agent(text));
-                false
+                self.stage_completed_turn(text);
+                self.commit_pending_completed_turn();
+                self.clear_chat_history();
+                FinalizeOutcome::None
             }
         }
     }
 
     fn apply_shared_snapshot(&mut self, snapshot: SharedStateSnapshot) {
         let recommendations_changed = self.recommendations != snapshot.recommendations;
+        let completed_turns_changed = self.completed_turns != snapshot.completed_turns;
         let permission_changed = self
             .permission
             .as_ref()
@@ -861,10 +1098,12 @@ impl App {
         self.state = snapshot.state;
         self.agent_name = snapshot.agent_name;
         self.agent_model = snapshot.agent_model;
+        self.prompt_name = snapshot.prompt_name;
         self.progress_status = snapshot.progress_status;
         self.session_id = snapshot.session_id;
         self.wt_connected = snapshot.wt_connected;
         self.messages = snapshot.messages;
+        self.completed_turns = snapshot.completed_turns;
         self.recommendations = snapshot.recommendations;
         self.agent_streaming = snapshot.agent_streaming;
         self.pending_thought_response = snapshot.pending_thought_response;
@@ -880,6 +1119,15 @@ impl App {
                 .unwrap_or(0);
             if self.recommendations.is_some() {
                 self.selection_visible_pending = true;
+            }
+        }
+
+        if completed_turns_changed {
+            if self.completed_turns.is_empty() {
+                self.selected_history = None;
+                self.expanded_history = None;
+            } else {
+                self.focus_latest_completed_turn();
             }
         }
 
@@ -902,6 +1150,8 @@ impl App {
         } else {
             self.permission = None;
         }
+
+        self.normalize_history_state();
     }
 }
 
@@ -951,4 +1201,45 @@ fn append_thought_preview(buffer: &mut String, chunk: &str) {
         .skip(char_count.saturating_sub(THOUGHT_PREVIEW_MAX_CHARS))
         .collect();
     *buffer = format!("...{tail}");
+}
+
+fn now_unix_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+fn clamp_cursor_to_boundary(input: &str, cursor_pos: usize) -> usize {
+    let mut clamped = cursor_pos.min(input.len());
+    while clamped > 0 && !input.is_char_boundary(clamped) {
+        clamped -= 1;
+    }
+    clamped
+}
+
+fn prev_char_boundary(input: &str, cursor_pos: usize) -> usize {
+    let cursor_pos = clamp_cursor_to_boundary(input, cursor_pos);
+    if cursor_pos == 0 {
+        return 0;
+    }
+
+    input[..cursor_pos]
+        .char_indices()
+        .last()
+        .map(|(idx, _)| idx)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(input: &str, cursor_pos: usize) -> usize {
+    let cursor_pos = clamp_cursor_to_boundary(input, cursor_pos);
+    if cursor_pos >= input.len() {
+        return input.len();
+    }
+
+    input[cursor_pos..]
+        .chars()
+        .next()
+        .map(|ch| cursor_pos + ch.len_utf8())
+        .unwrap_or(input.len())
 }

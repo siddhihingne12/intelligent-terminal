@@ -51,7 +51,7 @@ impl PipeChannel {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("wta-pipe-debug.log")
+                .open(crate::runtime_paths::runtime_log_path("wta-pipe-debug.log"))
                 .ok();
             file.map(Mutex::new)
         } else {

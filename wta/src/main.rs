@@ -2,6 +2,7 @@ mod app;
 mod coordinator;
 mod event;
 mod protocol;
+mod runtime_paths;
 mod shared_host;
 mod shell;
 mod theme;
@@ -48,6 +49,10 @@ struct Cli {
     /// Agent CLI command (e.g. "copilot --acp --stdio")
     #[arg(long, global = true, default_value = "copilot --acp --stdio")]
     agent: String,
+
+    /// Delegate agent CLI command for spawned task tabs/panels (e.g. "copilot --model claude-haiku-4.5")
+    #[arg(long, global = true)]
+    delegate_agent: Option<String>,
 
     // Legacy flags (hidden, backward compat)
     #[arg(long, hide = true)]
@@ -921,12 +926,16 @@ async fn run_host_mode(cli: Cli, po: PipeOverride) -> Result<()> {
     };
 
     let local_set = tokio::task::LocalSet::new();
-    let host_pipe_name =
-        shared_host::pipe_name_for(resolved_pipe.as_ref(), Some(cli.agent.as_str()));
+    let host_pipe_name = shared_host::pipe_name_for(
+        resolved_pipe.as_ref(),
+        Some(cli.agent.as_str()),
+        cli.delegate_agent.as_deref(),
+    );
     local_set
         .run_until(shared_host::run_host_server(
             host_pipe_name,
             cli.agent,
+            cli.delegate_agent,
             Arc::new(shell_mgr),
             wt_connected,
         ))
@@ -935,21 +944,34 @@ async fn run_host_mode(cli: Cli, po: PipeOverride) -> Result<()> {
 
 async fn run_ensure_host_mode(cli: Cli, po: PipeOverride) -> Result<()> {
     let resolved_pipe = resolve_pipe_info(&po);
-    let host_pipe_name =
-        shared_host::pipe_name_for(resolved_pipe.as_ref(), Some(cli.agent.as_str()));
-    ensure_wta_host_running(&cli.agent, resolved_pipe.as_ref(), &host_pipe_name).await
+    let host_pipe_name = shared_host::pipe_name_for(
+        resolved_pipe.as_ref(),
+        Some(cli.agent.as_str()),
+        cli.delegate_agent.as_deref(),
+    );
+    ensure_wta_host_running(
+        &cli.agent,
+        cli.delegate_agent.as_deref(),
+        resolved_pipe.as_ref(),
+        &host_pipe_name,
+    )
+    .await
 }
 
 async fn run_attach_mode(cli: Cli, po: PipeOverride) -> Result<()> {
     let resolved_pipe = resolve_pipe_info(&po);
-    let host_pipe_name =
-        shared_host::pipe_name_for(resolved_pipe.as_ref(), Some(cli.agent.as_str()));
+    let host_pipe_name = shared_host::pipe_name_for(
+        resolved_pipe.as_ref(),
+        Some(cli.agent.as_str()),
+        cli.delegate_agent.as_deref(),
+    );
 
     let pane_identity = discover_local_pane_identity(&po).await;
     let pane_context = pane_context_from_identity(pane_identity.clone());
     run_attach_tui_mode(
         cli.prompt,
         cli.agent,
+        cli.delegate_agent,
         host_pipe_name,
         resolved_pipe,
         pane_context,
@@ -961,6 +983,7 @@ async fn run_attach_mode(cli: Cli, po: PipeOverride) -> Result<()> {
 async fn run_attach_tui_mode(
     initial_prompt: Option<String>,
     agent_cmd: String,
+    delegate_agent_cmd: Option<String>,
     host_pipe_name: String,
     pipe_info: Option<shell::wt_channel::ConnectionInfo>,
     pane_context: PaneContext,
@@ -977,6 +1000,7 @@ async fn run_attach_tui_mode(
         .run_until(run_attach_app(
             &mut terminal,
             agent_cmd,
+            delegate_agent_cmd,
             host_pipe_name,
             pipe_info,
             initial_prompt,
@@ -995,6 +1019,7 @@ async fn run_attach_tui_mode(
 async fn run_attach_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     agent_cmd: String,
+    delegate_agent_cmd: Option<String>,
     host_pipe_name: String,
     pipe_info: Option<shell::wt_channel::ConnectionInfo>,
     initial_prompt: Option<String>,
@@ -1028,6 +1053,7 @@ async fn run_attach_app(
     tokio::task::spawn_local(async move {
         if let Err(err) = ensure_attach_host_ready(
             agent_cmd,
+            delegate_agent_cmd,
             pipe_info,
             host_pipe_name,
             ensure_event_tx.clone(),
@@ -1061,6 +1087,7 @@ async fn run_attach_app(
 
 async fn ensure_attach_host_ready(
     agent_cmd: String,
+    delegate_agent_cmd: Option<String>,
     pipe_info: Option<shell::wt_channel::ConnectionInfo>,
     host_pipe_name: String,
     event_tx: tokio::sync::mpsc::UnboundedSender<app::AppEvent>,
@@ -1087,11 +1114,18 @@ async fn ensure_attach_host_ready(
     let _ = event_tx.send(app::AppEvent::ConnectionStage(
         "Starting shared host...".to_string(),
     ));
-    ensure_wta_host_running(&agent_cmd, pipe_info.as_ref(), &host_pipe_name).await
+    ensure_wta_host_running(
+        &agent_cmd,
+        delegate_agent_cmd.as_deref(),
+        pipe_info.as_ref(),
+        &host_pipe_name,
+    )
+    .await
 }
 
 async fn ensure_wta_host_running(
     agent_cmd: &str,
+    delegate_agent_cmd: Option<&str>,
     pipe_info: Option<&shell::wt_channel::ConnectionInfo>,
     host_pipe_name: &str,
 ) -> Result<()> {
@@ -1114,7 +1148,7 @@ async fn ensure_wta_host_running(
         .await
         .is_err()
     {
-        spawn_wta_host_process(agent_cmd, pipe_info)?;
+        spawn_wta_host_process(agent_cmd, delegate_agent_cmd, pipe_info)?;
     }
 
     shared_host::wait_for_host_ready(host_pipe_name, std::time::Duration::from_secs(30))
@@ -1124,6 +1158,7 @@ async fn ensure_wta_host_running(
 
 fn spawn_wta_host_process(
     agent_cmd: &str,
+    delegate_agent_cmd: Option<&str>,
     pipe_info: Option<&shell::wt_channel::ConnectionInfo>,
 ) -> Result<()> {
     let current_exe = std::env::current_exe()?;
@@ -1136,6 +1171,10 @@ fn spawn_wta_host_process(
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW);
+
+    if let Some(delegate_agent_cmd) = delegate_agent_cmd.filter(|cmd| !cmd.trim().is_empty()) {
+        command.arg("--delegate-agent").arg(delegate_agent_cmd);
+    }
 
     if let Some(info) = pipe_info {
         command.arg("--pipe-name").arg(&info.pipe_name);
@@ -1248,7 +1287,7 @@ async fn run_default_tui(cli: Cli, po: PipeOverride) -> Result<()> {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("wta-acp-debug.log")
+            .open(crate::runtime_paths::runtime_log_path("wta-acp-debug.log"))
         {
             let elapsed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1359,7 +1398,7 @@ async fn run_mcp_mode(po: &PipeOverride) -> Result<()> {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("wta-mcp-debug.log")
+            .open(crate::runtime_paths::runtime_log_path("wta-mcp-debug.log"))
         {
             let elapsed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1474,7 +1513,7 @@ async fn run_acp_tui_mode(
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("wta-acp-debug.log")
+            .open(crate::runtime_paths::runtime_log_path("wta-acp-debug.log"))
         {
             let elapsed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1733,7 +1772,7 @@ async fn run_acp_app(
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open("wta-acp-debug.log")
+            .open(crate::runtime_paths::runtime_log_path("wta-acp-debug.log"))
         {
             let elapsed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1745,9 +1784,11 @@ async fn run_acp_app(
 
     let startup = std::time::Instant::now();
     let agent_cmd = cli.agent.clone();
+    let delegate_agent_cmd = cli.delegate_agent.clone();
     acp_startup_log(&format!(
-        "run_acp_app start agent={} wt_connected={} pane_identity={:?} (t+{:.3}s)",
+        "run_acp_app start agent={} delegate_agent={:?} wt_connected={} pane_identity={:?} (t+{:.3}s)",
         agent_cmd,
+        delegate_agent_cmd,
         wt_connected,
         pane_identity,
         startup.elapsed().as_secs_f64()
@@ -1799,11 +1840,15 @@ async fn run_acp_app(
 
             let executor_event_tx = event_tx.clone();
             let executor_shell_mgr = shell_mgr.clone();
+            let delegate_agent_runtimes = coordinator::default_delegate_agent_runtimes(
+                delegate_agent_cmd.as_deref(),
+                Some(agent_cmd.as_str()),
+            );
             tokio::task::spawn_local(coordinator::run_recommendation_executor(
                 recommendation_rx,
                 executor_event_tx,
                 executor_shell_mgr,
-                coordinator::default_delegate_agent_runtimes(),
+                delegate_agent_runtimes,
             ));
             acp_startup_log(&format!(
                 "run_acp_app recommendation executor spawned (t+{:.3}s)",

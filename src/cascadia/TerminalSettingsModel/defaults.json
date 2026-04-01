@@ -35,6 +35,7 @@
 
     // Agent Integration
     "agentCliPath": "",
+    "delegateAgentCliPath": "",
     "agentPanePosition": "bottom",
 
     "profiles":

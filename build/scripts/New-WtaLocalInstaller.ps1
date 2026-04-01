@@ -263,6 +263,71 @@ function Find-XamlAppx {
     return $candidate.FullName
 }
 
+function Get-AppxPackageIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PackagePath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($PackagePath)
+    try {
+        $manifestEntry = $archive.GetEntry('AppxManifest.xml')
+        if (-not $manifestEntry) {
+            throw "Could not find AppxManifest.xml inside $PackagePath."
+        }
+
+        $reader = New-Object System.IO.StreamReader($manifestEntry.Open())
+        try {
+            $manifestContent = $reader.ReadToEnd()
+        }
+        finally {
+            $reader.Dispose()
+        }
+    }
+    finally {
+        $archive.Dispose()
+    }
+
+    [xml]$manifestXml = $manifestContent
+    $namespaceManager = New-Object System.Xml.XmlNamespaceManager($manifestXml.NameTable)
+    $namespaceManager.AddNamespace('appx', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $identityNode = $manifestXml.SelectSingleNode('/appx:Package/appx:Identity', $namespaceManager)
+    if (-not $identityNode) {
+        throw "Could not find the Identity node in AppxManifest.xml from $PackagePath."
+    }
+
+    return [pscustomobject]@{
+        Name = $identityNode.Name
+        Version = $identityNode.Version
+        Publisher = $identityNode.Publisher
+        ProcessorArchitecture = $identityNode.ProcessorArchitecture
+    }
+}
+
+function Get-AppxManifestIdentity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ManifestPath
+    )
+
+    [xml]$manifestXml = Get-Content -Path $ManifestPath -Raw
+    $namespaceManager = New-Object System.Xml.XmlNamespaceManager($manifestXml.NameTable)
+    $namespaceManager.AddNamespace('appx', 'http://schemas.microsoft.com/appx/manifest/foundation/windows10')
+    $identityNode = $manifestXml.SelectSingleNode('/appx:Package/appx:Identity', $namespaceManager)
+    if (-not $identityNode) {
+        throw "Could not find the Identity node in $ManifestPath."
+    }
+
+    return [pscustomobject]@{
+        Name = $identityNode.Name
+        Version = $identityNode.Version
+        Publisher = $identityNode.Publisher
+        ProcessorArchitecture = $identityNode.ProcessorArchitecture
+    }
+}
+
 function Get-SingleChildDirectoryOrSelf {
     param([string]$RootPath)
 
@@ -287,11 +352,38 @@ function Build-TerminalPackage {
     )
 
     $openConsoleModule = Join-Path $RepoRoot 'tools\OpenConsole.psm1'
+    $solutionPath = Join-Path $RepoRoot 'OpenConsole.slnx'
+    $packagesConfig = Join-Path $RepoRoot 'dep\nuget\packages.config'
+    $packageProject = Join-Path $RepoRoot 'src\cascadia\CascadiaPackage\CascadiaPackage.wapproj'
+
     Write-Status "Building CascadiaPackage for $PlatformName/$ConfigurationName ..."
 
     Import-Module $openConsoleModule -Force
     Set-MsbuildDevEnvironment
-    Invoke-OpenConsoleBuild /t:CascadiaPackage "/p:Platform=$PlatformName" "/p:Configuration=$ConfigurationName" /m /nologo
+
+    & "$RepoRoot\dep\nuget\nuget.exe" restore $solutionPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "NuGet restore failed for $solutionPath."
+    }
+
+    & "$RepoRoot\dep\nuget\nuget.exe" restore $packagesConfig
+    if ($LASTEXITCODE -ne 0) {
+        throw "NuGet restore failed for $packagesConfig."
+    }
+
+    & msbuild.exe $packageProject `
+        "/p:Platform=$PlatformName" `
+        "/p:Configuration=$ConfigurationName" `
+        "/p:SolutionDir=$RepoRoot\" `
+        "/p:OpenConsoleDir=$RepoRoot\" `
+        '/p:WindowsTerminalBranding=Dev' `
+        '/p:GenerateAppxPackageOnBuild=true' `
+        '/p:AppxBundle=Never' `
+        /m `
+        /nologo
+    if ($LASTEXITCODE -ne 0) {
+        throw "msbuild failed for $packageProject."
+    }
 }
 
 $repoRoot = Resolve-AbsolutePath -Path (Join-Path $PSScriptRoot '..\..')
@@ -301,6 +393,8 @@ $unpackagedScript = Join-Path $repoRoot 'build\scripts\New-UnpackagedTerminalDis
 $installerScript = Join-Path $repoRoot 'installer\install-local-terminal.ps1'
 $installerCmd = Join-Path $repoRoot 'installer\install.cmd'
 $installerBootstrapManifest = Join-Path $repoRoot 'installer\bootstrap\Cargo.toml'
+$plannerPromptTemplate = Join-Path $repoRoot 'wta\prompts\terminal-agent.md'
+$devManifestPath = Join-Path $repoRoot 'src\cascadia\CascadiaPackage\Package-Dev.appxmanifest'
 
 if (-not (Test-Path $unpackagedScript -PathType Leaf)) {
     throw "Could not find $unpackagedScript."
@@ -314,6 +408,14 @@ if (-not (Test-Path $installerCmd -PathType Leaf)) {
 if (-not (Test-Path $installerBootstrapManifest -PathType Leaf)) {
     throw "Could not find $installerBootstrapManifest."
 }
+if (-not (Test-Path $plannerPromptTemplate -PathType Leaf)) {
+    throw "Could not find $plannerPromptTemplate."
+}
+if (-not (Test-Path $devManifestPath -PathType Leaf)) {
+    throw "Could not find $devManifestPath."
+}
+
+$expectedManifestIdentity = Get-AppxManifestIdentity -ManifestPath $devManifestPath
 
 Ensure-Directory -Path $destinationRoot
 
@@ -340,6 +442,13 @@ if (-not (Test-Path $XamlAppx -PathType Leaf)) {
     throw "XAML package not found: $XamlAppx"
 }
 
+$packageIdentity = Get-AppxPackageIdentity -PackagePath $TerminalMsix
+$installerVersion = $packageIdentity.Version
+
+if ($BuildTerminal -and $installerVersion -ne $expectedManifestIdentity.Version) {
+    throw "Built package version $installerVersion does not match source manifest version $($expectedManifestIdentity.Version). Refusing to package a stale MSIX."
+}
+
 $cargoPath = Find-CargoPath
 $rustTarget = Get-RustTarget -PlatformName $Platform
 $installedTargets = Get-InstalledRustTargets
@@ -354,7 +463,7 @@ $terminalZipRoot = Join-Path $stageRoot 'terminal-zip'
 $payloadExtractRoot = Join-Path $stageRoot 'payload-extracted'
 $installerSourceRoot = Join-Path $stageRoot 'installer-source'
 $payloadZip = Join-Path $stageRoot 'payload.zip'
-$setupExeName = "agentic-terminal-{0}-{1}-setup.exe" -f $Platform.ToLowerInvariant(), $Configuration.ToLowerInvariant()
+$setupExeName = "agentic-terminal-{0}-{1}-{2}-setup.exe" -f $installerVersion, $Platform.ToLowerInvariant(), $Configuration.ToLowerInvariant()
 $setupExePath = Join-Path $destinationRoot $setupExeName
 
 Ensure-Directory -Path $stageRoot
@@ -365,6 +474,7 @@ Ensure-Directory -Path $installerSourceRoot
 Write-Status "Creating unpackaged Terminal distribution from:"
 Write-Status "  Terminal package: $TerminalMsix"
 Write-Status "  XAML dependency:  $XamlAppx"
+Write-Status "  Version:          $installerVersion"
 $unpackagedZip = & $unpackagedScript -TerminalAppX $TerminalMsix -XamlAppX $XamlAppx -Destination $terminalZipRoot -PortableMode
 
 if (-not $unpackagedZip) {
@@ -398,6 +508,24 @@ if (-not (Test-Path $resolvedWtaExePath -PathType Leaf)) {
 
 Write-Status "Injecting wta.exe into the unpackaged payload ..."
 Copy-Item -Path $resolvedWtaExePath -Destination (Join-Path $payloadRoot 'wta.exe') -Force
+
+$payloadPromptDir = Join-Path $payloadRoot 'prompts'
+Ensure-Directory -Path $payloadPromptDir
+Write-Status "Injecting planner prompt template into the payload ..."
+Copy-Item -Path $plannerPromptTemplate -Destination (Join-Path $payloadPromptDir 'terminal-agent.default.md') -Force
+
+$payloadMetadata = [ordered]@{
+    productName = 'Agentic Terminal'
+    version = $installerVersion
+    packageName = $packageIdentity.Name
+    publisher = $packageIdentity.Publisher
+    processorArchitecture = $packageIdentity.ProcessorArchitecture
+    platform = $Platform
+    configuration = $Configuration
+    createdAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+}
+$payloadMetadataPath = Join-Path $payloadRoot 'agentic-terminal-install-metadata.json'
+Set-Content -Path $payloadMetadataPath -Value ($payloadMetadata | ConvertTo-Json -Depth 4) -Encoding utf8
 
 if (Test-Path $payloadZip -PathType Leaf) {
     Remove-Item $payloadZip -Force

@@ -889,6 +889,7 @@ namespace winrt::TerminalApp::implementation
             {
                 agentCliPath = _DetectAgentCli();
             }
+            const auto delegateAgentCliPath = globals.DelegateAgentCliPath();
 
             if (!agentCliPath.empty())
             {
@@ -898,6 +899,16 @@ namespace winrt::TerminalApp::implementation
                     agentStr.replace(pos, 1, L"\"\"");
                 }
                 cmdline += fmt::format(FMT_COMPILE(L" --agent \"{}\""), agentStr);
+            }
+
+            if (!delegateAgentCliPath.empty())
+            {
+                std::wstring delegateStr{ delegateAgentCliPath };
+                for (size_t pos = 0; (pos = delegateStr.find(L'"', pos)) != std::wstring::npos; pos += 2)
+                {
+                    delegateStr.replace(pos, 1, L"\"\"");
+                }
+                cmdline += fmt::format(FMT_COMPILE(L" --delegate-agent \"{}\""), delegateStr);
             }
         }
         else

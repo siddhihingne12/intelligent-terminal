@@ -12,8 +12,13 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
 
-use crate::app::{AppEvent, ChatMessage, ConnectionState, DebugDir, DebugMessage, PermOption};
-use crate::coordinator::{parse_recommendation_set, RecommendationChoice, RecommendationSet};
+use crate::app::{
+    AppEvent, ChatMessage, CompletedTurn, ConnectionState, DebugDir, DebugMessage, PermOption,
+};
+use crate::coordinator::{
+    parse_recommendation_set, validate_recommendation_set_for_coordinator_target,
+    RecommendationChoice, RecommendationSet,
+};
 use crate::protocol::acp::client::{prompt_timing_log, run_acp_client, PromptSubmission};
 use crate::shell::wt_channel::ConnectionInfo;
 use crate::shell::ShellManager;
@@ -48,10 +53,14 @@ pub struct SharedStateSnapshot {
     #[serde(default)]
     pub agent_model: Option<String>,
     #[serde(default)]
+    pub prompt_name: Option<String>,
+    #[serde(default)]
     pub progress_status: Option<String>,
     pub session_id: String,
     pub wt_connected: bool,
     pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub completed_turns: Vec<CompletedTurn>,
     pub recommendations: Option<RecommendationSet>,
     pub agent_streaming: bool,
     #[serde(default)]
@@ -124,7 +133,13 @@ pub enum SharedUiEvent {
         model: Option<String>,
         session_id: String,
     },
+    PromptTemplateLoaded {
+        name: String,
+    },
     AgentError {
+        message: String,
+    },
+    ExecutionInfo {
         message: String,
     },
     UserMessage {
@@ -180,7 +195,13 @@ impl SharedUiEvent {
                 model: model.clone(),
                 session_id: session_id.clone(),
             }),
+            AppEvent::PromptTemplateLoaded { name } => {
+                Some(Self::PromptTemplateLoaded { name: name.clone() })
+            }
             AppEvent::AgentError(message) => Some(Self::AgentError {
+                message: message.clone(),
+            }),
+            AppEvent::ExecutionInfo(message) => Some(Self::ExecutionInfo {
                 message: message.clone(),
             }),
             AppEvent::AgentThoughtChunk(text) => {
@@ -221,9 +242,9 @@ impl SharedUiEvent {
             | AppEvent::Resize(_, _)
             | AppEvent::DebugPipeMessage(_)
             | AppEvent::SharedStateSnapshot(_)
-            | AppEvent::UserMessage(_)
             | AppEvent::SharedPermissionRequest { .. }
             | AppEvent::PermissionCleared => None,
+            AppEvent::UserMessage(_) => None,
         }
     }
 
@@ -240,7 +261,9 @@ impl SharedUiEvent {
                 model,
                 session_id,
             },
+            Self::PromptTemplateLoaded { name } => AppEvent::PromptTemplateLoaded { name },
             Self::AgentError { message } => AppEvent::AgentError(message),
+            Self::ExecutionInfo { message } => AppEvent::ExecutionInfo(message),
             Self::UserMessage { text } => AppEvent::UserMessage(text),
             Self::AgentThoughtChunk { text } => AppEvent::AgentThoughtChunk(text),
             Self::AgentMessageChunk { text } => AppEvent::AgentMessageChunk(text),
@@ -262,19 +285,24 @@ impl SharedUiEvent {
     }
 }
 
-fn normalize_agent_command(agent_cmd: Option<&str>) -> String {
-    agent_cmd
+fn normalize_command(command: Option<&str>) -> String {
+    command
         .map(|cmd| cmd.split_whitespace().collect::<Vec<_>>().join(" "))
         .unwrap_or_default()
 }
 
-pub fn pipe_name_for(pipe_info: Option<&ConnectionInfo>, agent_cmd: Option<&str>) -> String {
+pub fn pipe_name_for(
+    pipe_info: Option<&ConnectionInfo>,
+    agent_cmd: Option<&str>,
+    delegate_agent_cmd: Option<&str>,
+) -> String {
     let mut hasher = DefaultHasher::new();
     pipe_info
         .map(|info| info.pipe_name.as_str())
         .unwrap_or("local-only")
         .hash(&mut hasher);
-    normalize_agent_command(agent_cmd).hash(&mut hasher);
+    normalize_command(agent_cmd).hash(&mut hasher);
+    normalize_command(delegate_agent_cmd).hash(&mut hasher);
     format!(r"\\.\pipe\wta-shared-host-{:016x}", hasher.finish())
 }
 
@@ -386,6 +414,7 @@ pub async fn run_attach_client(
 pub async fn run_host_server(
     host_pipe_name: String,
     agent_cmd: String,
+    delegate_agent_cmd: Option<String>,
     shell_mgr: Arc<ShellManager>,
     wt_connected: bool,
 ) -> Result<()> {
@@ -404,11 +433,15 @@ pub async fn run_host_server(
     let (prompt_tx, prompt_rx) = mpsc::unbounded_channel::<PromptSubmission>();
     let (recommendation_tx, recommendation_rx) = mpsc::unbounded_channel();
 
+    let delegate_agent_runtimes = crate::coordinator::default_delegate_agent_runtimes(
+        delegate_agent_cmd.as_deref(),
+        Some(agent_cmd.as_str()),
+    );
     tokio::spawn(crate::coordinator::run_recommendation_executor(
         recommendation_rx,
         event_tx.clone(),
         shell_mgr.clone(),
-        crate::coordinator::default_delegate_agent_runtimes(),
+        delegate_agent_runtimes,
     ));
 
     tokio::task::spawn_local(run_acp_client(
@@ -826,7 +859,11 @@ fn handle_host_command(
                         .map(|client| client.pane_context.clone())
                 };
 
-                state.record_prompt_submission(text.clone());
+                state.record_prompt_submission(
+                    text.clone(),
+                    effective_context.clone(),
+                    submitted_at_unix_s,
+                );
                 broadcast_event(clients, &SharedUiEvent::UserMessage { text: text.clone() });
                 prompt_timing_log(
                     prompt_id,
@@ -869,7 +906,9 @@ fn handle_host_command(
                     .cloned();
 
                 if let Some(selected) = maybe_choice {
+                    state.commit_pending_completed_turn();
                     state.clear_recommendations();
+                    state.push_execution_info(format!("Executing choice {}.", selected.choice));
                     broadcast_snapshot(clients, &state.snapshot());
                     if recommendation_tx.send(selected).is_err() {
                         state.push_system_message(
@@ -1079,7 +1118,7 @@ fn host_log(message: &str) {
     if let Ok(mut file) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("wta-host-debug.log")
+        .open(crate::runtime_paths::runtime_log_path("wta-host-debug.log"))
     {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1105,6 +1144,11 @@ struct AttachedClient {
     updates: mpsc::UnboundedSender<HostServerMessage>,
 }
 
+enum FinalizeOutcome {
+    None,
+    SelectionReady,
+}
+
 enum HostCommand {
     AttachClient {
         client_id: u64,
@@ -1125,11 +1169,17 @@ struct HostSessionState {
     state: ConnectionState,
     agent_name: String,
     agent_model: Option<String>,
+    prompt_name: Option<String>,
     progress_status: Option<String>,
     session_id: String,
     wt_connected: bool,
     messages: Vec<ChatMessage>,
+    completed_turns: Vec<CompletedTurn>,
     recommendations: Option<RecommendationSet>,
+    current_prompt_pane_context: Option<PaneContext>,
+    current_prompt_text: Option<String>,
+    current_prompt_submitted_at_unix_s: Option<f64>,
+    pending_completed_turn: Option<CompletedTurn>,
     agent_streaming: bool,
     pending_thought_response: String,
     pending_agent_response: String,
@@ -1147,11 +1197,17 @@ impl HostSessionState {
             state: ConnectionState::Connecting("Starting agent...".to_string()),
             agent_name: String::new(),
             agent_model: None,
+            prompt_name: None,
             progress_status: None,
             session_id: String::new(),
             wt_connected,
             messages: Vec::new(),
+            completed_turns: Vec::new(),
             recommendations: None,
+            current_prompt_pane_context: None,
+            current_prompt_text: None,
+            current_prompt_submitted_at_unix_s: None,
+            pending_completed_turn: None,
             agent_streaming: false,
             pending_thought_response: String::new(),
             pending_agent_response: String::new(),
@@ -1169,10 +1225,12 @@ impl HostSessionState {
             state: self.state.clone(),
             agent_name: self.agent_name.clone(),
             agent_model: self.agent_model.clone(),
+            prompt_name: self.prompt_name.clone(),
             progress_status: self.progress_status.clone(),
             session_id: self.session_id.clone(),
             wt_connected: self.wt_connected,
             messages: self.messages.clone(),
+            completed_turns: self.completed_turns.clone(),
             recommendations: self.recommendations.clone(),
             agent_streaming: self.agent_streaming,
             pending_thought_response: self.pending_thought_response.clone(),
@@ -1187,8 +1245,16 @@ impl HostSessionState {
         self.version += 1;
     }
 
-    fn record_prompt_submission(&mut self, text: String) {
+    fn record_prompt_submission(
+        &mut self,
+        text: String,
+        pane_context: Option<PaneContext>,
+        submitted_at_unix_s: f64,
+    ) {
         self.clear_chat_history();
+        self.current_prompt_pane_context = pane_context;
+        self.current_prompt_text = Some(text.clone());
+        self.current_prompt_submitted_at_unix_s = Some(submitted_at_unix_s);
         self.prompt_in_flight = true;
         self.agent_streaming = false;
         self.progress_status = Some("Preparing context...".to_string());
@@ -1204,6 +1270,8 @@ impl HostSessionState {
         self.pending_thought_response.clear();
         self.pending_agent_response.clear();
         self.timing_note = None;
+        self.current_prompt_submitted_at_unix_s = None;
+        self.pending_completed_turn = None;
         self.messages.push(ChatMessage::Error(message));
         self.permission = None;
         self.permission_responder = None;
@@ -1212,6 +1280,15 @@ impl HostSessionState {
 
     fn push_system_message(&mut self, message: String) {
         self.messages.push(ChatMessage::System(message));
+        self.bump();
+    }
+
+    fn push_execution_info(&mut self, message: String) {
+        if let Some(turn) = self.completed_turns.last_mut() {
+            turn.details.push(ChatMessage::System(message));
+        } else {
+            self.messages.push(ChatMessage::System(message));
+        }
         self.bump();
     }
 
@@ -1229,6 +1306,9 @@ impl HostSessionState {
         self.pending_agent_response.clear();
         self.agent_streaming = false;
         self.timing_note = None;
+        self.current_prompt_text = None;
+        self.current_prompt_submitted_at_unix_s = None;
+        self.pending_completed_turn = None;
         self.clear_recommendations();
     }
 
@@ -1241,6 +1321,54 @@ impl HostSessionState {
         self.pending_thought_response.clear();
         self.pending_agent_response.clear();
         self.agent_streaming = false;
+        self.current_prompt_text = None;
+        self.current_prompt_submitted_at_unix_s = None;
+    }
+
+    fn completion_latency_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+
+        if let Some(submitted_at) = self.current_prompt_submitted_at_unix_s {
+            let total_s = (now_unix_s() - submitted_at).max(0.0);
+            parts.push(format!("total {:.3}s", total_s));
+        }
+
+        if let Some(note) = self.timing_note.as_deref().filter(|note| !note.is_empty()) {
+            parts.push(note.to_string());
+        }
+
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!("Latency: {}", parts.join(" | ")))
+        }
+    }
+
+    fn current_turn_details(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter(|message| !matches!(message, ChatMessage::User(_)))
+            .cloned()
+            .collect()
+    }
+
+    fn stage_completed_turn(&mut self, agent_text: String) {
+        let Some(prompt) = self.current_prompt_text.clone() else {
+            self.pending_completed_turn = None;
+            return;
+        };
+
+        let mut details = self.current_turn_details();
+        details.push(ChatMessage::Agent(agent_text));
+        self.pending_completed_turn = Some(CompletedTurn { prompt, details });
+    }
+
+    fn commit_pending_completed_turn(&mut self) {
+        let Some(turn) = self.pending_completed_turn.take() else {
+            return;
+        };
+
+        self.completed_turns.push(turn);
     }
 
     fn apply_agent_event(&mut self, event: AppEvent) {
@@ -1264,8 +1392,15 @@ impl HostSessionState {
                 self.state = ConnectionState::Connected;
                 self.bump();
             }
+            AppEvent::PromptTemplateLoaded { name } => {
+                self.prompt_name = Some(name);
+                self.bump();
+            }
             AppEvent::AgentError(message) => {
                 self.push_error(message);
+            }
+            AppEvent::ExecutionInfo(message) => {
+                self.push_execution_info(message);
             }
             AppEvent::AgentThoughtChunk(text) => {
                 self.prompt_in_flight = true;
@@ -1288,8 +1423,14 @@ impl HostSessionState {
                 self.prompt_in_flight = false;
                 self.progress_status = None;
                 self.pending_thought_response.clear();
-                if self.finalize_agent_response() {
-                    self.clear_completed_turn_history();
+                if let Some(summary) = self.completion_latency_summary() {
+                    self.push_execution_info(summary);
+                }
+                match self.finalize_agent_response() {
+                    FinalizeOutcome::SelectionReady => {
+                        self.clear_completed_turn_history();
+                    }
+                    FinalizeOutcome::None => {}
                 }
                 self.bump();
             }
@@ -1352,30 +1493,51 @@ impl HostSessionState {
         }
     }
 
-    fn finalize_agent_response(&mut self) -> bool {
+    fn finalize_agent_response(&mut self) -> FinalizeOutcome {
         if self.pending_agent_response.trim().is_empty() {
             self.pending_agent_response.clear();
-            return false;
+            return FinalizeOutcome::None;
         }
 
         let text = std::mem::take(&mut self.pending_agent_response);
         match parse_recommendation_set(&text) {
             Ok(recommendations) => {
+                if validate_recommendation_set_for_coordinator_target(
+                    &recommendations,
+                    self.current_prompt_pane_context
+                        .as_ref()
+                        .and_then(|context| context.pane_id.as_deref()),
+                )
+                .is_err()
+                {
+                    self.recommendations = None;
+                    self.pending_completed_turn = None;
+                    self.stage_completed_turn(text);
+                    self.commit_pending_completed_turn();
+                    self.clear_chat_history();
+                    return FinalizeOutcome::None;
+                }
+                self.stage_completed_turn(text);
                 self.recommendations = Some(recommendations);
-                true
+                FinalizeOutcome::SelectionReady
             }
-            Err(err) => {
+            Err(_) => {
                 self.recommendations = None;
-                let error_text = format!("{:#}", err).replace('\n', " | ");
-                self.messages.push(ChatMessage::System(format!(
-                    "Agent returned invalid recommendation JSON: {}",
-                    error_text
-                )));
-                self.messages.push(ChatMessage::Agent(text));
-                false
+                self.pending_completed_turn = None;
+                self.stage_completed_turn(text);
+                self.commit_pending_completed_turn();
+                self.clear_chat_history();
+                FinalizeOutcome::None
             }
         }
     }
+}
+
+fn now_unix_s() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 const THOUGHT_PREVIEW_MAX_CHARS: usize = 1024;

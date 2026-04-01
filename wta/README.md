@@ -2,6 +2,9 @@
 
 A Rust TUI client, MCP tool server, and tmux-like CLI that connects AI agents to Windows Terminal.
 
+Customization:
+- See [CUSTOMIZATION.md](CUSTOMIZATION.md) for changing the agent model and runtime prompt.
+
 ## Quick Start
 
 ### Build

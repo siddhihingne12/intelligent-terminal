@@ -1628,6 +1628,7 @@ void WindowEmperor::_startCoordinatorIfEnabled()
     {
         agentCliPath = winrt::hstring{ detectDefaultAgentCliForHostPrewarm() };
     }
+    const auto delegateAgentCliPath = globals.DelegateAgentCliPath();
 
     std::wstring cmdline;
     appendQuotedCommandArg(cmdline, wtaPath);
@@ -1636,6 +1637,11 @@ void WindowEmperor::_startCoordinatorIfEnabled()
     {
         cmdline += L" --agent";
         appendQuotedCommandArg(cmdline, std::wstring_view{ agentCliPath });
+    }
+    if (!delegateAgentCliPath.empty())
+    {
+        cmdline += L" --delegate-agent";
+        appendQuotedCommandArg(cmdline, std::wstring_view{ delegateAgentCliPath });
     }
     cmdline += L" --pipe-name";
     appendQuotedCommandArg(cmdline, _protocolPipeName);

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{App, ChatMessage, PlanEntryStatus};
 use crate::theme;
@@ -38,10 +38,23 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         reversed_lines.push(activity_line);
     }
 
+    let mut pending_lines = build_pending_stream_lines(app);
+    reversed_lines.extend(pending_lines.drain(..).rev());
+
     for (idx, msg) in app.messages.iter().enumerate().rev() {
         let is_last_message = idx + 1 == app.messages.len();
         let mut message_lines = build_message_lines(msg, is_last_message, app.agent_streaming);
         reversed_lines.extend(message_lines.drain(..).rev());
+        if reversed_lines.len() >= requested_lines {
+            break;
+        }
+    }
+
+    for (idx, turn) in app.completed_turns.iter().enumerate().rev() {
+        let selected = app.history_row_selected(idx);
+        let expanded = app.history_row_expanded(idx);
+        let mut turn_lines = build_completed_turn_lines(turn, selected, expanded);
+        reversed_lines.extend(turn_lines.drain(..).rev());
         if reversed_lines.len() >= requested_lines {
             break;
         }
@@ -61,6 +74,7 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(lines)
         .block(inner)
+        .wrap(Wrap { trim: false })
         .scroll((scroll as u16, 0));
 
     frame.render_widget(paragraph, area);
@@ -76,6 +90,36 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
             area.height
         )
     });
+}
+
+fn build_completed_turn_lines<'a>(
+    turn: &'a crate::app::CompletedTurn,
+    selected: bool,
+    expanded: bool,
+) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
+    let prompt_style = if selected {
+        theme::SELECTED
+    } else {
+        theme::USER_PROMPT
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled("> ", prompt_style),
+        Span::styled(truncate_render_text(&turn.prompt), prompt_style),
+    ]));
+
+    if expanded {
+        for message in &turn.details {
+            let mut detail_lines = build_message_lines(message, false, false);
+            for line in detail_lines.drain(..) {
+                lines.push(indent_line(line));
+            }
+        }
+    }
+
+    lines.push(Line::default());
+    lines
 }
 
 fn build_activity_line(app: &App) -> Option<Line<'static>> {
@@ -115,25 +159,42 @@ fn animated_activity_label(frame: usize) -> Vec<Span<'static>> {
 }
 
 fn activity_preview(app: &App) -> Option<(String, Style)> {
-    if !app.pending_agent_response.trim().is_empty() {
-        return Some((
-            single_line_tail_preview(&app.pending_agent_response),
-            theme::AGENT_TEXT,
-        ));
-    }
-
-    if !app.pending_thought_response.trim().is_empty() {
-        return Some((
-            single_line_tail_preview(&app.pending_thought_response),
-            theme::SYSTEM_TEXT,
-        ));
-    }
-
     app.progress_status
         .as_deref()
         .map(single_line_tail_preview)
         .filter(|text| !text.is_empty())
         .map(|text| (text, theme::DIM))
+}
+
+fn build_pending_stream_lines(app: &App) -> Vec<Line<'_>> {
+    if !app.pending_agent_response.trim().is_empty() {
+        return build_pending_text_lines("Assistant", &app.pending_agent_response, theme::AGENT_TEXT);
+    }
+
+    if !app.pending_thought_response.trim().is_empty() {
+        return build_pending_text_lines("Thinking", &app.pending_thought_response, theme::SYSTEM_TEXT);
+    }
+
+    Vec::new()
+}
+
+fn build_pending_text_lines<'a>(label: &str, text: &'a str, style: Style) -> Vec<Line<'a>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(format!("{label}:"), theme::DIM)));
+
+    for line_text in text.lines() {
+        lines.push(Line::from(Span::styled(
+            truncate_render_text(line_text),
+            style,
+        )));
+    }
+
+    if text.lines().next().is_none() {
+        lines.push(Line::from(Span::styled("", style)));
+    }
+
+    lines.push(Line::default());
+    lines
 }
 
 fn single_line_tail_preview(text: &str) -> String {
@@ -218,6 +279,17 @@ fn build_message_lines<'a>(
         }
     }
     lines
+}
+
+fn indent_line<'a>(line: Line<'a>) -> Line<'a> {
+    if line.spans.is_empty() {
+        return line;
+    }
+
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled("  ", theme::DIM));
+    spans.extend(line.spans);
+    Line::from(spans)
 }
 
 fn truncate_render_text(text: &str) -> Cow<'_, str> {

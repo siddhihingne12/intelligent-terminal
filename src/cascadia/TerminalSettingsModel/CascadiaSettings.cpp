@@ -12,6 +12,7 @@
 #include <VersionHelpers.h>
 #include <WtExeUtils.h>
 
+#include <fstream>
 #include <shellapi.h>
 #include <til/latch.h>
 #include <til/env.h>
@@ -22,6 +23,54 @@ using namespace winrt::Microsoft::Terminal::Settings::Model::implementation;
 using namespace winrt::Microsoft::Terminal::Control;
 using namespace winrt::Windows::Foundation::Collections;
 using namespace Microsoft::Console;
+
+namespace
+{
+    static constexpr std::wstring_view InstallMetadataFileName{ L"agentic-terminal-install-metadata.json" };
+
+    std::optional<winrt::hstring> _readInstalledVersionFromMetadata()
+    {
+        std::filesystem::path metadataPath{ GetWtExePath() };
+        metadataPath.replace_filename(InstallMetadataFileName);
+        if (!std::filesystem::exists(metadataPath))
+        {
+            return std::nullopt;
+        }
+
+        std::ifstream input{ metadataPath, std::ios::binary };
+        if (!input)
+        {
+            return std::nullopt;
+        }
+
+        const std::string content{
+            std::istreambuf_iterator<char>{ input },
+            std::istreambuf_iterator<char>{}
+        };
+
+        Json::Value json;
+        std::string errs;
+        const std::unique_ptr<Json::CharReader> reader{ Json::CharReaderBuilder{}.newCharReader() };
+        if (!reader->parse(content.data(), content.data() + content.size(), &json, &errs))
+        {
+            return std::nullopt;
+        }
+
+        const auto& version = json["version"];
+        if (!version.isString())
+        {
+            return std::nullopt;
+        }
+
+        const auto versionString = version.asString();
+        if (versionString.empty())
+        {
+            return std::nullopt;
+        }
+
+        return winrt::to_hstring(versionString);
+    }
+}
 
 // Creating a child of a profile requires us to copy certain
 // required attributes. This method handles those attributes.
@@ -1065,6 +1114,15 @@ winrt::hstring CascadiaSettings::ApplicationVersion()
         const auto version{ package.Id().Version() };
         winrt::hstring formatted{ wil::str_printf<std::wstring>(L"%u.%u.%u.%u", version.Major, version.Minor, version.Build, version.Revision) };
         return formatted;
+    }
+    CATCH_LOG();
+
+    try
+    {
+        if (const auto metadataVersion = _readInstalledVersionFromMetadata())
+        {
+            return *metadataVersion;
+        }
     }
     CATCH_LOG();
 

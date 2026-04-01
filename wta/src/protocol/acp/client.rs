@@ -1,3 +1,4 @@
+use super::prompt;
 use acp::Agent as _;
 use agent_client_protocol as acp;
 use anyhow::Result;
@@ -112,6 +113,19 @@ fn first_visible_text_gap(
     }
 
     ("n/a".to_string(), "n/a")
+}
+
+fn final_timing_note(
+    submitted_at_unix_s: f64,
+    context_ready_at_unix_s: Option<f64>,
+    prompt_sent_at_unix_s: Option<f64>,
+    completed_at_unix_s: f64,
+) -> String {
+    format!(
+        "submit->context_ready {} | prompt_sent->options_shown {}",
+        format_elapsed(Some(submitted_at_unix_s), context_ready_at_unix_s),
+        format_elapsed(prompt_sent_at_unix_s, Some(completed_at_unix_s))
+    )
 }
 
 pub fn prompt_timing_log(turn_id: u64, submitted_at_unix_s: f64, phase: &str, details: &str) {
@@ -307,7 +321,7 @@ impl PromptTimingState {
         }
     }
 
-    fn observe_first_text(&self, text_len: usize) -> Option<String> {
+    fn observe_first_text(&self, text_len: usize) {
         let now = now_unix_s();
         let mut guard = self.active.lock().unwrap();
         if let Some(active) = guard.as_mut() {
@@ -327,18 +341,10 @@ impl PromptTimingState {
                     visible_gap,
                     visible_gap_source
                 );
-                let note = if visible_gap == "n/a" {
-                    None
-                } else {
-                    Some(format!("visible-gap {}", visible_gap))
-                };
                 drop(guard);
                 prompt_timing_log(turn_id, submitted_at_unix_s, "first_text", &details);
-                return note;
             }
         }
-
-        None
     }
 
     fn observe_first_tool_call(&self, title: Option<&str>) {
@@ -408,11 +414,11 @@ impl PromptTimingState {
         }
     }
 
-    fn complete(&self, success: bool, error: Option<&str>) {
+    fn complete(&self, success: bool, error: Option<&str>) -> Option<String> {
         let now = now_unix_s();
         let mut active = self.active.lock().unwrap();
         let Some(active_prompt) = active.take() else {
-            return;
+            return None;
         };
         drop(active);
 
@@ -532,6 +538,13 @@ impl PromptTimingState {
             "prompt_complete",
             &details.join(" "),
         );
+
+        Some(final_timing_note(
+            active_prompt.submitted_at_unix_s,
+            active_prompt.context_ready_at_unix_s,
+            active_prompt.prompt_sent_at_unix_s,
+            now,
+        ))
     }
 }
 
@@ -539,6 +552,37 @@ fn summarize_agent_identity(program: &str, args: &[&str]) -> (String, Option<Str
     let brand = humanize_agent_brand(program);
     let model = extract_model_arg(args).map(humanize_model_name);
     (brand, model)
+}
+
+fn requested_model_id(args: &[&str]) -> Option<String> {
+    extract_model_arg(args).map(ToOwned::to_owned)
+}
+
+fn complete_prompt_request<T, E: std::fmt::Display>(
+    result: std::result::Result<T, E>,
+    prompt_timing: &PromptTimingState,
+    event_tx: &mpsc::UnboundedSender<AppEvent>,
+) {
+    match result {
+        Ok(_) => {
+            let timing_note = prompt_timing.complete(true, None);
+            if let Some(note) = timing_note {
+                let _ = event_tx.send(AppEvent::TimingMetric(note));
+            }
+            let _ = event_tx.send(AppEvent::AgentMessageEnd);
+        }
+        Err(e) => {
+            let error_message = e.to_string();
+            let timing_note = prompt_timing.complete(false, Some(&error_message));
+            if let Some(note) = timing_note {
+                let _ = event_tx.send(AppEvent::TimingMetric(note));
+            }
+            let _ = event_tx.send(AppEvent::AgentError(format!(
+                "prompt error: {}",
+                error_message
+            )));
+        }
+    }
 }
 
 fn extract_model_arg<'a>(args: &'a [&'a str]) -> Option<&'a str> {
@@ -682,107 +726,6 @@ async fn live_active_pane_context(shell_mgr: &ShellManager) -> Option<String> {
     Some(format_active_pane_context(&snapshot))
 }
 
-fn planner_prompt_rules() -> String {
-    String::from(
-        "You are Terminal Agent, a Windows Terminal co-ordinator.\n\
-         Your job is to plan the best next steps for the user and return executable action JSON for WTA.\n\
-         Do not read files, run commands, use tools, inspect the repo, or fix issues directly.\n\
-         Do not use local `wta`, shell commands, or MCP tools yourself in this session.\n\
-         Only analyze the provided terminal context and propose ranked actions for WTA to execute after user selection.\n\
-         \n\
-         Action types you may emit:\n\
-         - `run_command`: send a shell command plus Enter to an existing shell pane.\n\
-         - `send_prompt`: send a prompt plus Enter to an existing agent pane.\n\
-         - `create_shell_tab`: open a new persistent WT shell tab. If `commandline` is set, WTA will type it into the new shell after creation.\n\
-         - `create_shell_panel`: split a new persistent WT shell pane from a parent pane. If `commandline` is set, WTA will type it into the new shell after creation.\n\
-         - `delegate_tab`: open a new WT tab, optionally set its cwd/title, start the chosen delegate agent command there, then send the prompt plus Enter.\n\
-         \n\
-         Rules:\n\
-         - Always return exactly 3 ranked choices.\n\
-         - Every choice must contain at least one executable action.\n\
-         - Never emit an empty `actions` array.\n\
-         - There is no `wait`, `noop`, `observe`, or informational-only action type.\n\
-         - If waiting seems best, convert that idea into an actual executable action instead of a no-op.\n\
-         - The recommended choice must also be executable right now.\n\
-         - At least one choice should reuse an existing relevant pane when practical.\n\
-         - At least one choice should delegate a hard or long-running task to a supported agent when appropriate.\n\
-         - For simple shell checks in the source pane, prefer `run_command` on the source pane instead of creating a new pane or tab.\n\
-         - Simple inspection commands like `git status`, `git worktree list`, `git branch`, `pwd`, `ls`, or `dir` should normally be `run_command` on the source pane unless the user explicitly asked for isolation.\n\
-        - `run_command`, `send_prompt`, and `create_shell_panel` must include a `parent` pane ID from the terminal context JSON.\n\
-        - `create_shell_tab` and `delegate_tab` do not use a `parent` field.\n\
-        - Use only `agent` IDs that appear in the supported delegate agent JSON.\n\
-         - `send_prompt` is for agent panes, not shell panes.\n\
-         - For delegate actions, make the `prompt` fully self-contained. WTA will only launch the delegate CLI and paste exactly that prompt.\n\
-         - Delegate prompts should include the user goal, the relevant context from the terminal snapshot, and the concrete next task.\n\
-         - When opening a new tab or pane for shell work or delegation, set the action `cwd` to the relevant repo/directory when `sourceCwd` or another obvious working directory is available.\n\
-         - For `delegate_tab`, include both the `cwd` field and the working directory path inside the prompt text when the task is tied to a specific repo.\n\
-         - Delegation is tab-only. Do not propose delegate pane splits.\n\
-         - Prefer `delegate_tab` for Copilot when the work is hard, long-running, or should stay isolated from the current pane.\n\
-         - Prefer the source pane when the user refers to the terminal they were working in before opening this assistant.\n\
-         - The `sourceTarget` pane in the terminal context is the original pane the user was working in before the assistant opened. It may differ from the currently focused assistant pane.\n\
-         - When diagnosing an error, inspect the `sourceTarget` buffer first. Do not treat the assistant pane buffer as the source shell unless `sourceTarget` and `activeTarget` are the same pane.\n\
-         - Only use `create_shell_tab` or `create_shell_panel` when the user explicitly asked for a new destination or when isolation is materially useful.\n\
-         - Do not use `create_shell_tab` or `create_shell_panel` just to run a short one-off command that fits in the source pane.\n\
-         - Do not invent capabilities that are not in the action list.\n\
-         - Do not describe passive waiting as a choice unless you can express it as one of the supported action types.\n\
-         - Do not include placeholders, TODO actions, or actions that require the user to interpret the result before WTA can execute them.\n\
-         - Make titles concise and rationales short.\n\
-         - Never answer as a normal chat assistant. Even for greetings, vague requests, or missing terminal context, still return exactly 3 ranked choices and the required JSON block.\n\
-         - If context is missing, use safe meta-choices that ask for the missing context or open an appropriate shell tab for the user to continue. Do not return prose-only answers.\n\
-         - If no pane IDs are available in context, do not emit `run_command`, `send_prompt`, or `create_shell_panel` actions.\n\
-         \n\
-         Response format:\n\
-         1. Three short numbered suggestions for the user.\n\
-         2. One fenced JSON block with this shape and no additional JSON blocks:\n\
-         3. In the JSON block, each of the 3 choices must contain a non-empty `actions` array.\n\
-         ```json\n\
-         {\n\
-           \"recommended_choice\": 1,\n\
-           \"choices\": [\n\
-             {\n\
-               \"choice\": 1,\n\
-               \"title\": \"Delegate to Copilot in a new tab\",\n\
-               \"rationale\": \"Best for a hard coding task that should run separately.\",\n\
-               \"actions\": [\n\
-                {\n\
-                  \"type\": \"delegate_tab\",\n\
-                  \"agent\": \"copilot\",\n\
-                  \"cwd\": \"D:\\\\repo\",\n\
-                  \"prompt\": \"You are working in D:\\\\repo. Investigate the failing test path shown in the terminal context, identify the root cause, make the smallest safe fix, and summarize what changed.\",\n\
-                   \"title\": \"Copilot delegate\"\n\
-                 }\n\
-               ]\n\
-             },\n\
-             {\n\
-               \"choice\": 2,\n\
-               \"title\": \"Run a command in the source pane\",\n\
-               \"rationale\": \"Fastest local verification path.\",\n\
-               \"actions\": [\n\
-                 {\n\
-                   \"type\": \"run_command\",\n\
-                   \"parent\": \"10\",\n\
-                   \"command\": \"dotnet test\"\n\
-                 }\n\
-               ]\n\
-             },\n\
-             {\n\
-               \"choice\": 3,\n\
-               \"title\": \"Prompt the current agent pane\",\n\
-               \"rationale\": \"Keeps work in the current assistant session.\",\n\
-               \"actions\": [\n\
-                 {\n\
-                   \"type\": \"send_prompt\",\n\
-                   \"parent\": \"14\",\n\
-                   \"prompt\": \"Take the smaller next step...\"\n\
-                 }\n\
-               ]\n\
-             }\n\
-           ]\n\
-         }\n\
-         ```",
-    )
-}
-
 fn format_pane_context_summary(pane_context: Option<&PaneContext>) -> String {
     match pane_context {
         Some(context) => format!(
@@ -810,6 +753,7 @@ async fn build_terminal_context_json(
     shell_mgr: &ShellManager,
     pane_context: Option<&PaneContext>,
 ) -> Option<String> {
+    let coordinator_target = pane_context.and_then(|context| context.pane_id.clone());
     let source_pane_id = pane_context
         .and_then(|context| context.effective_source_pane_id())
         .map(str::to_string);
@@ -881,6 +825,7 @@ async fn build_terminal_context_json(
                 } else {
                     None
                 };
+                let is_coordinator_target = coordinator_target.as_deref() == Some(pane_id.as_str());
 
                 panels_json.push(serde_json::json!({
                     "id": pane_id.clone(),
@@ -891,6 +836,8 @@ async fn build_terminal_context_json(
                     "is_active": is_active,
                     "pid": pid,
                     "role": pane_role,
+                    "isCoordinatorTarget": is_coordinator_target,
+                    "sendPromptAllowed": !is_coordinator_target,
                     "cwd": if source_pane_id.as_deref() == Some(pane_id.as_str()) { source_cwd.clone() } else { None },
                     "buffer": buffer,
                 }));
@@ -909,6 +856,7 @@ async fn build_terminal_context_json(
 
     serde_json::to_string_pretty(&serde_json::json!({
         "activeTarget": active_pane_id,
+        "coordinatorTarget": coordinator_target,
         "sourceTarget": source_pane_id,
         "sourceTabId": source_tab_id,
         "sourceWindowId": source_window_id,
@@ -925,24 +873,29 @@ async fn build_prompt_text(
     shell_mgr: &ShellManager,
     wt_connected: bool,
     pane_context: Option<&PaneContext>,
-) -> String {
+) -> (String, String, String) {
     let total_started = std::time::Instant::now();
-    let mut context_parts = Vec::new();
+    let mut runtime_sections = Vec::new();
 
-    let rules_started = std::time::Instant::now();
-    context_parts.push(planner_prompt_rules());
+    let template_started = std::time::Instant::now();
+    let planner_template = prompt::load_planner_prompt_template();
     prompt_timing_log(
         prompt_id,
         submitted_at_unix_s,
-        "planner_rules_ready",
-        &format!("dt={:.3}s", rules_started.elapsed().as_secs_f64()),
+        "planner_template_ready",
+        &format!(
+            "name={:?} source={} dt={:.3}s",
+            planner_template.display_name,
+            planner_template.source_label,
+            template_started.elapsed().as_secs_f64()
+        ),
     );
 
     let agents_started = std::time::Instant::now();
     let supported_agents_json = serde_json::to_string_pretty(&default_supported_delegate_agents())
         .unwrap_or_else(|_| "[]".to_string());
-    context_parts.push(format!(
-        "Supported delegate agents:\n```json\n{}\n```",
+    runtime_sections.push(format!(
+        "## Supported Delegate Agents\n```json\n{}\n```",
         supported_agents_json
     ));
     prompt_timing_log(
@@ -966,8 +919,8 @@ async fn build_prompt_text(
             ),
         );
         if let Some(terminal_context_json) = terminal_context_json {
-            context_parts.push(format!(
-                "Terminal context JSON:\n```json\n{}\n```",
+            runtime_sections.push(format!(
+                "## Terminal Context JSON\n```json\n{}\n```",
                 terminal_context_json
             ));
         }
@@ -993,15 +946,15 @@ async fn build_prompt_text(
         ),
     );
     if let Some(active_pane) = active_pane {
-        context_parts.push(active_pane.trim_end().to_string());
+        runtime_sections.push(format!(
+            "## Focused Pane Context\n{}",
+            active_pane.trim_end()
+        ));
     }
 
     let assemble_started = std::time::Instant::now();
-    let prompt = format!(
-        "{}\n\nUser request:\n{}",
-        context_parts.join("\n\n"),
-        user_text
-    );
+    let prompt_body = prompt::merge_runtime_sections(&planner_template.content, &runtime_sections);
+    let prompt = format!("{}\n\n## User Request\n{}", prompt_body, user_text);
     prompt_timing_log(
         prompt_id,
         submitted_at_unix_s,
@@ -1013,7 +966,11 @@ async fn build_prompt_text(
             prompt.len()
         ),
     );
-    prompt
+    (
+        prompt,
+        planner_template.source_label,
+        planner_template.display_name,
+    )
 }
 
 /// Write a line to wta-acp-debug.log.
@@ -1030,7 +987,7 @@ fn acp_log(msg: &str) {
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("wta-acp-debug.log")
+        .open(crate::runtime_paths::runtime_log_path("wta-acp-debug.log"))
     {
         let elapsed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1039,15 +996,21 @@ fn acp_log(msg: &str) {
     }
 }
 
-fn acp_log_built_prompt(user_text: &str, pane_context: Option<&PaneContext>, prompt_text: &str) {
+fn acp_log_built_prompt(
+    user_text: &str,
+    pane_context: Option<&PaneContext>,
+    prompt_source: &str,
+    prompt_text: &str,
+) {
     if !acp_log_enabled() {
         return;
     }
 
     acp_log(&format!(
-        "planner_prompt_begin user_text_len={} pane_context={}",
+        "planner_prompt_begin user_text_len={} pane_context={} prompt_source={}",
         user_text.len(),
-        format_pane_context_summary(pane_context)
+        format_pane_context_summary(pane_context),
+        prompt_source
     ));
     acp_log(&format!("planner_prompt_text:\n{}", prompt_text));
     acp_log("planner_prompt_end");
@@ -1266,13 +1229,9 @@ impl acp::Client for WtaClient {
             }
             acp::SessionUpdate::AgentMessageChunk(chunk) => {
                 if let acp::ContentBlock::Text(text_content) = chunk.content {
-                    let timing_note = self
-                        .state
+                    self.state
                         .prompt_timing
                         .observe_first_text(text_content.text.len());
-                    if let Some(note) = timing_note {
-                        let _ = self.state.event_tx.send(AppEvent::TimingMetric(note));
-                    }
                     let _ = self
                         .state
                         .event_tx
@@ -1590,6 +1549,27 @@ async fn run_inner(
     let session_id = session.session_id.clone();
     startup_probe.log(&format!("Session created: {}", session_id));
 
+    if let Some(requested_model) = requested_model_id(args) {
+        let _ = event_tx.send(AppEvent::ConnectionStage(format!(
+            "Selecting model {}...",
+            requested_model
+        )));
+        startup_probe.log(&format!("Setting ACP session model to {}", requested_model));
+        conn.set_session_model(acp::SetSessionModelRequest::new(
+            session_id.clone(),
+            requested_model.clone(),
+        ))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "set_session_model failed for requested model {}: {}",
+                requested_model,
+                e
+            )
+        })?;
+        startup_probe.log(&format!("ACP session model set to {}", requested_model));
+    }
+
     // Notify app of connection
     let (agent_name, agent_model) = summarize_agent_identity(program, args);
     let _ = event_tx.send(AppEvent::AgentConnected {
@@ -1602,7 +1582,7 @@ async fn run_inner(
     while let Some(prompt) = prompt_rx.recv().await {
         state.prompt_timing.activate(&prompt);
         let _ = event_tx.send(AppEvent::ProgressStatus("Preparing context...".to_string()));
-        let text = build_prompt_text(
+        let (text, prompt_source, prompt_name) = build_prompt_text(
             prompt.id,
             prompt.submitted_at_unix_s,
             &prompt.text,
@@ -1611,8 +1591,14 @@ async fn run_inner(
             prompt.pane_context.as_ref(),
         )
         .await;
+        let _ = event_tx.send(AppEvent::PromptTemplateLoaded { name: prompt_name });
         state.prompt_timing.mark_context_ready(text.len());
-        acp_log_built_prompt(&prompt.text, prompt.pane_context.as_ref(), &text);
+        acp_log_built_prompt(
+            &prompt.text,
+            prompt.pane_context.as_ref(),
+            &prompt_source,
+            &text,
+        );
         let _ = event_tx.send(AppEvent::ProgressStatus("Thinking...".to_string()));
         state.prompt_timing.mark_prompt_sent();
         let result = conn
@@ -1621,13 +1607,7 @@ async fn run_inner(
                 vec![text.into()],
             ))
             .await;
-        let _ = event_tx.send(AppEvent::AgentMessageEnd);
-        if let Err(e) = result {
-            state.prompt_timing.complete(false, Some(&e.to_string()));
-            let _ = event_tx.send(AppEvent::AgentError(format!("prompt error: {}", e)));
-        } else {
-            state.prompt_timing.complete(true, None);
-        }
+        complete_prompt_request(result, &state.prompt_timing, &event_tx);
     }
 
     Ok(())
@@ -1635,7 +1615,12 @@ async fn run_inner(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_model_arg, summarize_agent_identity};
+    use super::{
+        complete_prompt_request, extract_model_arg, requested_model_id, summarize_agent_identity,
+        PromptTimingState,
+    };
+    use crate::app::AppEvent;
+    use tokio::sync::mpsc;
 
     #[test]
     fn parses_model_from_separate_flag() {
@@ -1659,5 +1644,46 @@ mod tests {
 
         assert_eq!(brand, "GitHub Copilot");
         assert_eq!(model.as_deref(), Some("GPT 5 Mini"));
+    }
+
+    #[test]
+    fn requested_model_returns_owned_value() {
+        let args = ["--acp", "--stdio", "--model", "claude-haiku-4.5"];
+        assert_eq!(
+            requested_model_id(&args).as_deref(),
+            Some("claude-haiku-4.5")
+        );
+    }
+
+    #[test]
+    fn successful_prompt_completion_emits_message_end_only() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let prompt_timing = PromptTimingState::default();
+
+        complete_prompt_request(Ok::<(), &str>(()), &prompt_timing, &event_tx);
+
+        match event_rx.try_recv() {
+            Ok(AppEvent::AgentMessageEnd) => {}
+            Ok(_) => panic!("expected AgentMessageEnd"),
+            Err(err) => panic!("expected AgentMessageEnd, got channel error: {err}"),
+        }
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_prompt_completion_emits_error_only() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let prompt_timing = PromptTimingState::default();
+
+        complete_prompt_request(Err::<(), _>("boom"), &prompt_timing, &event_tx);
+
+        match event_rx.try_recv() {
+            Ok(AppEvent::AgentError(message)) => {
+                assert_eq!(message, "prompt error: boom");
+            }
+            Ok(_) => panic!("expected AgentError"),
+            Err(err) => panic!("expected AgentError, got channel error: {err}"),
+        }
+        assert!(event_rx.try_recv().is_err());
     }
 }

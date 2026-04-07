@@ -4,7 +4,6 @@
 #include "pch.h"
 #include "ProtocolRequestHandler.h"
 #include "TerminalProtocolServer.h"
-#include "TerminalProtocolComServer.h"
 #include "WindowEmperor.h"
 #include "AppHost.h"
 
@@ -280,8 +279,10 @@ void ProtocolRequestHandler::_ensurePageEventsRegistered()
     // Subscribe directly — til::typed_event is thread-safe for subscription
     // from any thread.  The handler may be invoked on the UI thread (since
     // TerminalPage raises the event there for safe _tabs access), so we
-    // dispatch pipe broadcast + COM callback delivery to the thread pool.
-    // COM callbacks must be called from MTA-compatible threads, not the STA.
+    // dispatch pipe broadcast to the thread pool.
+    // NOTE: COM client notification is handled by TerminalProtocolComServer's
+    // own subscription — do NOT call s_NotifyEventToComClients here to avoid
+    // duplicate events.
     for (const auto& host : _emperor._windows)
     {
         const auto page = _getPage(host.get());
@@ -290,6 +291,9 @@ void ProtocolRequestHandler::_ensurePageEventsRegistered()
 
         page.ProtocolVtSequenceReceived(
             [](auto&&, const winrt::hstring& eventJson) {
+                auto* svr = ProtocolRequestHandler::GetPipeServer();
+                if (!svr)
+                    return;
                 auto* ctx = new std::string(winrt::to_string(eventJson));
                 TrySubmitThreadpoolCallback(
                     [](PTP_CALLBACK_INSTANCE, PVOID p) {
@@ -298,7 +302,6 @@ void ProtocolRequestHandler::_ensurePageEventsRegistered()
                         {
                             svr->BroadcastEvent(*str);
                         }
-                        TerminalProtocolComServer::s_NotifyEventToComClients(*str);
                         delete str;
                     },
                     ctx, nullptr);

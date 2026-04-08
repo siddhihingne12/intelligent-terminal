@@ -532,7 +532,7 @@ if (Test-Path $payloadZip -PathType Leaf) {
 }
 
 Write-Status "Packing installer payload ..."
-& tar.exe -c --format=zip -f $payloadZip -C (Split-Path $payloadRoot -Parent) (Split-Path $payloadRoot -Leaf)
+& "$env:SystemRoot\System32\tar.exe" -c --format=zip -f $payloadZip -C (Split-Path $payloadRoot -Parent) (Split-Path $payloadRoot -Leaf)
 if ($LASTEXITCODE -ne 0) {
     throw 'Creating payload.zip failed.'
 }

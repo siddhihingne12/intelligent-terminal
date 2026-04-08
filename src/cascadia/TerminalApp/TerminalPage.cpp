@@ -909,6 +909,12 @@ namespace winrt::TerminalApp::implementation
             cmdline += L" --agent " + quoteArg(std::wstring_view{ agentCliPath });
         }
 
+        const auto delegateAgentCliPath = globals.DelegateAgentCliPath();
+        if (!delegateAgentCliPath.empty())
+        {
+            cmdline += L" --delegate-agent " + quoteArg(std::wstring_view{ delegateAgentCliPath });
+        }
+
         if (const auto pipeName = _WindowProperties.ProtocolPipeName(); !pipeName.empty())
         {
             cmdline += L" --pipe-name " + quoteArg(std::wstring_view{ pipeName });

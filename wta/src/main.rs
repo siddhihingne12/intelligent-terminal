@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, default_value = "copilot --acp --stdio")]
     agent: String,
 
+    /// Delegate agent CLI command (e.g. "codex")
+    #[arg(long)]
+    delegate_agent: Option<String>,
+
     // Legacy flags (hidden, backward compat)
     #[arg(long, hide = true)]
     mcp: bool,
@@ -236,6 +240,10 @@ enum Command {
         /// Agent CLI command (used to derive delegate agent commandline)
         #[arg(long, default_value = "copilot --acp --stdio")]
         agent: String,
+
+        /// Delegate agent CLI command (e.g. "codex")
+        #[arg(long)]
+        delegate_agent: Option<String>,
 
         /// Working directory for the delegate agent tab
         #[arg(long)]
@@ -505,10 +513,11 @@ async fn main() -> Result<()> {
         Some(Command::Delegate {
             prompt,
             agent,
+            delegate_agent,
             cwd,
             source_pane,
         }) => {
-            run_delegate(&pipe_override, &prompt, &agent, cwd.as_deref(), source_pane.as_deref()).await
+            run_delegate(&pipe_override, &prompt, &agent, delegate_agent.as_deref(), cwd.as_deref(), source_pane.as_deref()).await
         }
 
         // ── Quick pick ──
@@ -971,6 +980,7 @@ async fn run_delegate(
     po: &PipeOverride,
     prompt: &str,
     agent_cmd: &str,
+    delegate_agent_cmd: Option<&str>,
     cwd: Option<&str>,
     source_pane: Option<&str>,
 ) -> Result<()> {
@@ -993,7 +1003,7 @@ async fn run_delegate(
     let shell_mgr = ShellManager::new()
         .with_wt_channel(Arc::new(channel) as Arc<dyn shell::wt_channel::WtChannel>);
 
-    match delegate_with_context(&shell_mgr, prompt, agent_cmd, source_pane, cwd).await {
+    match delegate_with_context(&shell_mgr, prompt, agent_cmd, delegate_agent_cmd, source_pane, cwd).await {
         Ok(()) => { dlog("delegate OK"); Ok(()) }
         Err(e) => { dlog(&format!("delegate FAILED: {:#}", e)); Err(e) }
     }
@@ -1006,6 +1016,7 @@ async fn delegate_with_context(
     shell_mgr: &ShellManager,
     prompt: &str,
     agent_cmd: &str,
+    delegate_agent_cmd: Option<&str>,
     source_pane_id: Option<&str>,
     cwd: Option<&str>,
 ) -> Result<()> {
@@ -1036,7 +1047,7 @@ async fn delegate_with_context(
 
     // Build the delegate agent commandline.
     let delegate_agents = crate::coordinator::default_delegate_agent_runtimes(
-        None,
+        delegate_agent_cmd,
         Some(agent_cmd),
     );
     let runtime = delegate_agents
@@ -1044,6 +1055,7 @@ async fn delegate_with_context(
         .ok_or_else(|| anyhow::anyhow!("no delegate agent configured"))?;
 
     let commandline = crate::coordinator::build_delegate_commandline(runtime, &full_prompt)?;
+    let use_shell = crate::coordinator::needs_shell_launch(&runtime.commandline);
 
     // Log the final commandline for diagnostics.
     {
@@ -1055,10 +1067,11 @@ async fn delegate_with_context(
                     .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
             }
         }
-        dlog(&format!("delegate_with_context: commandline={:?} cwd={:?}", commandline, cwd));
+        dlog(&format!("delegate_with_context: commandline={:?} cwd={:?} use_shell={}", commandline, cwd, use_shell));
     }
 
-    // Create a new tab with the delegate agent.
+    // Launch the delegate agent directly as the tab process.
+    // CreateProcess passes args directly — no shell escaping issues.
     shell_mgr
         .wt_create_tab(Some(&commandline), cwd, None)
         .await?;
@@ -1160,6 +1173,10 @@ async fn run_ensure_host(
                             delegate_for_recs.as_deref(),
                             Some(agent_for_recs.as_str()),
                         );
+                    let delegate_agent_id = delegate_agents
+                        .first()
+                        .map(|r| r.id.clone())
+                        .unwrap_or_else(|| "copilot".to_string());
                     tokio::spawn(crate::coordinator::run_recommendation_executor(
                         rec_rx,
                         evt_tx,
@@ -1190,7 +1207,7 @@ async fn run_ensure_host(
                                             target: crate::coordinator::OpenTarget::Tab,
                                             parent: None,
                                             input: prompt,
-                                            agent: Some("copilot".into()),
+                                            agent: Some(delegate_agent_id.clone()),
                                             cwd: None,
                                             title: None,
                                         },
@@ -1691,7 +1708,7 @@ async fn run_acp_app(
             // Spawn the recommendation executor so selected choices actually run.
             let rec_event_tx = event_tx.clone();
             let delegate_agents = crate::coordinator::default_delegate_agent_runtimes(
-                None,
+                cli.delegate_agent.as_deref(),
                 Some(cli.agent.as_str()),
             );
             tokio::spawn(crate::coordinator::run_recommendation_executor(

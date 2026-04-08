@@ -9,6 +9,57 @@ use tokio::time::{sleep, Duration};
 use crate::app::AppEvent;
 use crate::shell::ShellManager;
 
+// ─── Agent CLI Registry ──────────────────────────────────────────────────────
+//
+// Each supported agent CLI has its own profile describing how to pass a prompt,
+// display name, etc. When adding a new agent, just add an entry here.
+
+/// How the agent CLI accepts a startup prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptFlag {
+    /// Flag before the prompt string, e.g. `-i "prompt"`.
+    Flag(&'static str),
+    /// Prompt is a bare positional argument, e.g. `codex "prompt"`.
+    Positional,
+}
+
+/// Static profile for a known agent CLI.
+#[derive(Debug, Clone)]
+pub struct AgentCliProfile {
+    pub id: &'static str,
+    pub display_name: &'static str,
+    pub prompt_flag: PromptFlag,
+}
+
+/// Registry of known agent CLIs.
+const KNOWN_AGENTS: &[AgentCliProfile] = &[
+    AgentCliProfile { id: "copilot",  display_name: "GitHub Copilot", prompt_flag: PromptFlag::Flag("-i") },
+    AgentCliProfile { id: "claude",   display_name: "Claude",         prompt_flag: PromptFlag::Positional },
+    AgentCliProfile { id: "codex",    display_name: "Codex",          prompt_flag: PromptFlag::Positional },
+];
+
+/// Default profile for unknown agents.
+const DEFAULT_AGENT_PROFILE: AgentCliProfile = AgentCliProfile {
+    id: "unknown",
+    display_name: "Agent",
+    prompt_flag: PromptFlag::Flag("-i"),
+};
+
+/// Look up an agent CLI profile by executable name.
+pub fn agent_cli_profile(executable: &str) -> &AgentCliProfile {
+    let lower = executable
+        .rsplit(|ch: char| ch == '\\' || ch == '/')
+        .next()
+        .unwrap_or(executable)
+        .strip_suffix(".exe")
+        .unwrap_or(executable)
+        .to_ascii_lowercase();
+    KNOWN_AGENTS
+        .iter()
+        .find(|p| p.id == lower)
+        .unwrap_or(&DEFAULT_AGENT_PROFILE)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SupportedDelegateAgent {
     pub id: String,
@@ -92,15 +143,40 @@ pub fn default_delegate_agent_runtimes(
 ) -> Vec<DelegateAgentRuntime> {
     let commandline = resolve_delegate_runtime_commandline(delegate_agent_cmd, agent_cmd)
         .unwrap_or_else(|| "copilot".to_string());
+    let (id, name) = derive_agent_identity(&commandline);
     vec![DelegateAgentRuntime {
-        id: "copilot".to_string(),
-        name: "GitHub Copilot".to_string(),
-        description:
-            "Launches `copilot` directly in a new terminal target with an interactive startup task prompt."
-                .to_string(),
+        id,
+        name,
+        description: format!(
+            "Launches `{}` directly in a new terminal target with an interactive startup task prompt.",
+            commandline.split_whitespace().next().unwrap_or("agent")
+        ),
         commandline,
         prompt_delivery: DelegatePromptDelivery::LaunchWithStartupPrompt,
     }]
+}
+
+/// Derive a (id, display_name) pair from a delegate agent commandline.
+fn derive_agent_identity(commandline: &str) -> (String, String) {
+    let first_token = commandline
+        .split_whitespace()
+        .next()
+        .unwrap_or(commandline);
+    let unquoted = first_token.trim_matches('"');
+    let profile = agent_cli_profile(unquoted);
+    if profile.id != "unknown" {
+        return (profile.id.to_string(), profile.display_name.to_string());
+    }
+    // Unknown agent — use the basename as both id and name.
+    let basename = unquoted
+        .rsplit(|ch: char| ch == '\\' || ch == '/')
+        .next()
+        .unwrap_or(unquoted);
+    let id = basename
+        .strip_suffix(".exe")
+        .unwrap_or(basename)
+        .to_ascii_lowercase();
+    (id.clone(), id)
 }
 
 pub fn parse_recommendation_set(text: &str) -> Result<RecommendationSet> {
@@ -263,6 +339,7 @@ async fn execute_choice(
                     .transpose()?;
                 let pane_id = match target {
                     OpenTarget::Tab => {
+                        // Launch the delegate agent directly as the tab process.
                         let result = shell_mgr
                             .wt_create_tab(
                                 commandline.as_deref(),
@@ -384,10 +461,14 @@ fn lookup_delegate_agent<'a>(
     delegate_agents: &'a [DelegateAgentRuntime],
     id: &str,
 ) -> Result<&'a DelegateAgentRuntime> {
+    // Try exact match first, then fall back to the first configured runtime.
+    // The ACP agent may request "copilot" but the user configured "codex" —
+    // honour the user's delegate setting.
     delegate_agents
         .iter()
         .find(|agent| agent.id == id)
-        .ok_or_else(|| anyhow!("unsupported delegate agent '{}'", id))
+        .or_else(|| delegate_agents.first())
+        .ok_or_else(|| anyhow!("no delegate agent configured"))
 }
 
 /// Build the full commandline for launching a delegate agent with a prompt.
@@ -426,7 +507,17 @@ fn resolve_delegate_runtime_commandline(
         return Some(commandline.to_string());
     }
 
-    resolve_copilot_delegate_runtime(agent_cmd)
+    // For copilot, strip ACP-specific flags to get a clean delegate command.
+    if let Some(copilot) = resolve_copilot_delegate_runtime(agent_cmd) {
+        return Some(copilot);
+    }
+
+    // For any other agent, derive the delegate command from the base executable name.
+    // Strip ACP/MCP flags (--acp, --stdio, --mcp) to get a standalone CLI invocation.
+    let agent_cmd = agent_cmd?;
+    let tokens = split_windows_commandline(agent_cmd);
+    let command = tokens.first()?;
+    Some(command.clone())
 }
 
 fn resolve_copilot_delegate_runtime(agent_cmd: Option<&str>) -> Option<String> {
@@ -482,6 +573,44 @@ fn is_copilot_command(command: &str) -> bool {
         .strip_suffix(".exe")
         .unwrap_or(executable)
         .eq_ignore_ascii_case("copilot")
+}
+
+/// Returns true if the command needs a `cmd /c` wrapper to run via CreateProcess.
+/// .exe files and shells (cmd, powershell, pwsh) don't need wrapping.
+/// Bare names like "codex" need wrapping if they resolve to .cmd/.bat on PATH.
+fn needs_cmd_wrapper(command: &str) -> bool {
+    let unquoted = command.trim_matches('"');
+    let lower = unquoted.to_ascii_lowercase();
+
+    // Already a .exe or a shell — no wrapping needed.
+    if lower.ends_with(".exe") || lower.ends_with(".com") {
+        return false;
+    }
+    let basename = lower.rsplit(|ch: char| ch == '\\' || ch == '/').next().unwrap_or(&lower);
+    if matches!(basename, "cmd" | "cmd.exe" | "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe") {
+        return false;
+    }
+
+    // If it's an absolute/relative path with an extension, check the extension.
+    if let Some(ext) = std::path::Path::new(unquoted).extension() {
+        let ext = ext.to_ascii_lowercase();
+        return ext == "cmd" || ext == "bat";
+    }
+
+    // Bare name (e.g. "codex") — check if <name>.exe exists on PATH.
+    // If it does, CreateProcess can find it directly; no wrapper needed.
+    use std::env;
+    if let Ok(path_var) = env::var("PATH") {
+        let exe_name = format!("{}.exe", unquoted);
+        for dir in env::split_paths(&path_var) {
+            if dir.join(&exe_name).is_file() {
+                return false;
+            }
+        }
+    }
+
+    // No .exe found on PATH — likely a .cmd/.bat shim, needs wrapping.
+    true
 }
 
 fn split_windows_commandline(commandline: &str) -> Vec<String> {
@@ -567,9 +696,25 @@ fn build_delegate_startup_prompt_commandline(commandline: &str, input: &str) -> 
 
     let mut args = Vec::with_capacity(tokens.len() + 2);
     args.extend(tokens.iter().map(String::as_str));
-    args.push("-i");
+
+    // Look up the agent's prompt flag from the CLI registry.
+    let exe = tokens.first().map(|s| s.trim_matches('"')).unwrap_or("");
+    let profile = agent_cli_profile(exe);
+    if let PromptFlag::Flag(flag) = profile.prompt_flag {
+        args.push(flag);
+    }
     args.push(input);
     Ok(join_windows_commandline(&args))
+}
+
+/// Returns true if the command cannot be launched directly via CreateProcess
+/// and should be typed into a shell tab instead (e.g. npm .cmd/.bat shims).
+pub fn needs_shell_launch(commandline: &str) -> bool {
+    let first_token = split_windows_commandline(commandline)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    needs_cmd_wrapper(&first_token)
 }
 
 // Quote arguments using the standard Windows CommandLineToArgvW escaping rules.

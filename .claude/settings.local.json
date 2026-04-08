@@ -28,7 +28,15 @@
       "Bash(/c/Users/kaitao/codes/agentic-terminal/wta/target/debug/wta.exe --help)",
       "Bash(powershell.exe:*)",
       "Read(//c//**)",
-      "Bash(where wta:*)"
+      "Bash(where wta:*)",
+      "Bash(echo \"EXIT_CODE=$?\")",
+      "Bash(where tar.exe)",
+      "Read(//c/Windows/System32/**)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(where codex.exe)",
+      "Bash(where codex:*)",
+      "Bash(where copilot:*)",
+      "Bash(where copilot.exe)"
     ]
   }
 }

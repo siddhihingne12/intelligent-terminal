@@ -55,7 +55,7 @@ $XamlAppX = Get-Item $XamlAppX | Select-Object -Expand FullName
 
 If ($TerminalAppX) {
 	$appxManifestPath = Join-Path $tempDir AppxManifest.xml
-	& tar.exe -x -f "$TerminalAppX" -C $tempDir AppxManifest.xml
+	& "$env:SystemRoot\System32\tar.exe" -x -f "$TerminalAppX" -C $tempDir AppxManifest.xml
 } ElseIf($TerminalLayout) {
 	$appxManifestPath = Join-Path $TerminalLayout AppxManifest.xml
 }
@@ -142,7 +142,7 @@ If ($PSCmdlet.ParameterSetName -Eq "AppX") {
 	# We only produce a ZIP when we're combining two AppX directories.
 	New-Item -ItemType Directory -Path $Destination -ErrorAction:SilentlyContinue | Out-Null
 	$outputZip = (Join-Path $Destination ("{0}.zip" -f ($distributionName)))
-	& tar -c --format=zip -f $outputZip -C $tempDir $terminalDir
+	& "$env:SystemRoot\System32\tar.exe" -c --format=zip -f $outputZip -C $tempDir $terminalDir
 	Remove-Item -Recurse -Force $tempDir -EA:SilentlyContinue
 	Get-Item $outputZip
 } ElseIf ($PSCmdlet.ParameterSetName -Eq "Layout") {

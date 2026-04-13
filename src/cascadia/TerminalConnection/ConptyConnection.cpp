@@ -63,6 +63,20 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             // The profile Guid does include the enclosing '{}'
             environment.as_map().insert_or_assign(L"WT_PROFILE_ID", Utils::GuidToString(_profileGuid));
 
+            // Protocol server credentials — read from the Terminal process env
+            // (set by WindowEmperor::_initializeProtocolServer). These must be
+            // injected here because regenerate() builds _initialEnv from the
+            // registry, not the process environment block.
+            {
+                wchar_t buf[512];
+                if (GetEnvironmentVariableW(L"WT_PIPE_NAME", buf, ARRAYSIZE(buf)))
+                    environment.as_map().insert_or_assign(L"WT_PIPE_NAME", buf);
+                if (GetEnvironmentVariableW(L"WT_MCP_TOKEN", buf, ARRAYSIZE(buf)))
+                    environment.as_map().insert_or_assign(L"WT_MCP_TOKEN", buf);
+                if (GetEnvironmentVariableW(L"WT_COM_CLSID", buf, ARRAYSIZE(buf)))
+                    environment.as_map().insert_or_assign(L"WT_COM_CLSID", buf);
+            }
+
             // WSLENV is a colon-delimited list of environment variables (+flags) that should appear inside WSL
             // https://devblogs.microsoft.com/commandline/share-environment-vars-between-wsl-and-windows/
 
@@ -89,6 +103,8 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                 L"WT_SESSION",
                 L"WT_PROFILE_ID",
                 L"WT_PIPE_NAME",
+                L"WT_MCP_TOKEN",
+                L"WT_COM_CLSID",
             };
             // Misdiagnosis in MSVC 14.44.35207. No pointer arithmetic in sight.
 #pragma warning(suppress : 26481) // Don't use pointer arithmetic. Use span instead (bounds.1).

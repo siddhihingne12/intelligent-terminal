@@ -15,6 +15,7 @@
 #include "AppHost.h"
 #include "TerminalProtocolServer.h"
 #include "ProtocolRequestHandler.h"
+#include "TerminalProtocolComServer.h"
 #include "resource.h"
 #include "VirtualDesktopUtils.h"
 #include "../../types/inc/User32Utils.hpp"
@@ -35,7 +36,11 @@ using VirtualKeyModifiers = winrt::Windows::System::VirtualKeyModifiers;
 // Constructor and destructor must be defined here where TerminalProtocolServer
 // and ProtocolRequestHandler are complete types (unique_ptr needs this).
 WindowEmperor::WindowEmperor() = default;
-WindowEmperor::~WindowEmperor() = default;
+WindowEmperor::~WindowEmperor()
+{
+    // Revoke COM class factory before destroying the handler it references.
+    LOG_IF_FAILED(TerminalProtocolComServer::s_StopListening());
+}
 
 #ifdef _WIN64
 static constexpr ULONG_PTR TERMINAL_HANDOFF_MAGIC = 0x4c414e494d524554; // 'TERMINAL'
@@ -1591,10 +1596,25 @@ void WindowEmperor::_initializeProtocolServer()
     _protocolHandler->SetServer(_protocolServer.get());
     _protocolServer->Start();
 
+    // Register COM class factory for cross-process access (runs on STA/UI thread).
+    TerminalProtocolComServer::s_setEmperor(this);
+    if (SUCCEEDED_LOG(TerminalProtocolComServer::s_StartListening()))
+    {
+        // Stringify the CLSID so child processes can discover us via CoCreateInstance.
+        wil::unique_cotaskmem_string clsidStr;
+        if (SUCCEEDED(StringFromCLSID(__uuidof(TerminalProtocolComServer), &clsidStr))
+            && clsidStr)
+        {
+            _comClsid = clsidStr.get();
+            SetEnvironmentVariableW(L"WT_COM_CLSID", _comClsid.c_str());
+        }
+    }
+
     // Debug: print credentials so dev builds can manually set WT_PIPE_NAME / WT_MCP_TOKEN.
-    OutputDebugStringA(fmt::format("WT Protocol Server started\n  WT_PIPE_NAME={}\n  WT_MCP_TOKEN={}\n",
+    OutputDebugStringA(fmt::format("WT Protocol Server started\n  WT_PIPE_NAME={}\n  WT_MCP_TOKEN={}\n  WT_COM_CLSID={}\n",
                                    winrt::to_string(_protocolPipeName),
-                                   _mcpToken)
+                                   _mcpToken,
+                                   winrt::to_string(_comClsid))
                            .c_str());
 }
 

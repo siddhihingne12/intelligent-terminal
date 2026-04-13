@@ -2671,6 +2671,35 @@ namespace winrt::TerminalApp::implementation
     //      on the right thread
     // Arguments:
     // - term: The newly created TermControl to connect the events for
+    std::string TerminalPage::_FindPaneIdForControl(const TermControl& control)
+    {
+        for (uint32_t tabIdx = 0; tabIdx < _tabs.Size(); ++tabIdx)
+        {
+            const auto tabImpl = _GetTabImpl(_tabs.GetAt(tabIdx));
+            if (!tabImpl)
+                continue;
+            const auto rootPane = tabImpl->GetRootPane();
+            if (!rootPane)
+                continue;
+
+            std::string found;
+            rootPane->WalkTree([&](const auto& pane) {
+                if (!found.empty())
+                    return;
+                if (const auto tc = pane->GetTerminalControl())
+                {
+                    if (tc == control && pane->ContentId().has_value())
+                    {
+                        found = std::to_string(pane->ContentId().value());
+                    }
+                }
+            });
+            if (!found.empty())
+                return found;
+        }
+        return {};
+    }
+
     void TerminalPage::_RegisterTerminalEvents(TermControl term)
     {
         term.RaiseNotice({ this, &TerminalPage::_ControlNoticeRaisedHandler });
@@ -2702,35 +2731,62 @@ namespace winrt::TerminalApp::implementation
 
         // Forward VT sequences and connection state changes to protocol clients.
         // This is unconditional — if no pipe client is listening, the event raise is a noop.
+        //
+        // We capture a weak ref to the TermControl and resolve the Pane's ContentId
+        // at event-fire time, because at _RegisterTerminalEvents time the Pane hasn't
+        // been created yet (TermControl is set up before the Pane wraps it).
+        //
+        // VtSequenceReceived fires on the connection reader thread (background).
+        // _FindPaneIdForControl accesses _tabs which has UI thread affinity,
+        // so we dispatch the pane ID lookup + event raise to the UI thread.
         {
-            const auto paneIdStr = std::to_string(term.ContentId());
+            winrt::weak_ref<TermControl> weakTerm{ term };
 
             term.VtSequenceReceived(
-                [weakThis = get_weak(), paneIdStr](auto&&, const winrt::hstring& seq) {
-                    if (auto strongThis = weakThis.get())
-                    {
-                        Json::Value evt;
-                        evt["type"] = "event";
-                        evt["method"] = "vt_sequence";
-                        Json::Value params;
-                        params["pane_id"] = paneIdStr;
-                        params["sequence"] = winrt::to_string(seq);
-                        evt["params"] = params;
-                        Json::StreamWriterBuilder wb;
-                        wb["indentation"] = "";
-                        strongThis->ProtocolVtSequenceReceived.raise(
-                            *strongThis,
-                            winrt::to_hstring(Json::writeString(wb, evt)));
-                    }
+                [weakThis = get_weak(), weakTerm](auto&&, const winrt::hstring& seq) {
+                    auto strongThis = weakThis.get();
+                    if (!strongThis)
+                        return;
+
+                    // Dispatch to UI thread: _FindPaneIdForControl accesses _tabs
+                    // which has UI thread affinity.  Fire-and-forget — don't block
+                    // the connection reader thread.
+                    strongThis->Dispatcher().RunAsync(
+                        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [weakThis, weakTerm, seq]() {
+                            auto page = weakThis.get();
+                            auto term2 = weakTerm.get();
+                            if (!page || !term2)
+                                return;
+
+                            const auto paneIdStr = page->_FindPaneIdForControl(term2);
+                            if (paneIdStr.empty())
+                                return;
+
+                            Json::Value evt;
+                            evt["type"] = "event";
+                            evt["method"] = "vt_sequence";
+                            Json::Value params;
+                            params["pane_id"] = paneIdStr;
+                            params["sequence"] = winrt::to_string(seq);
+                            evt["params"] = params;
+                            Json::StreamWriterBuilder wb;
+                            wb["indentation"] = "";
+                            page->ProtocolVtSequenceReceived.raise(
+                                *page,
+                                winrt::to_hstring(Json::writeString(wb, evt)));
+                        });
                 });
 
             term.ConnectionStateChanged(
-                [weakThis = get_weak(), paneIdStr, weakTerm = winrt::make_weak(term)](const auto& /*sender*/, auto&&) {
+                [weakThis = get_weak(), weakTerm](const auto& sender, auto&&) {
                     auto strongThis = weakThis.get();
-                    auto control = weakTerm.get();
-                    if (strongThis && control)
+                    if (!strongThis)
+                        return;
+
+                    std::string stateStr = "unknown";
+                    if (const auto control = sender.try_as<winrt::Microsoft::Terminal::Control::TermControl>())
                     {
-                        std::string stateStr;
                         switch (control.ConnectionState())
                         {
                         case ConnectionState::Connected:
@@ -2745,20 +2801,36 @@ namespace winrt::TerminalApp::implementation
                         default:
                             return;
                         }
-
-                        Json::Value evt;
-                        evt["type"] = "event";
-                        evt["method"] = "connection_state";
-                        Json::Value params;
-                        params["pane_id"] = paneIdStr;
-                        params["state"] = stateStr;
-                        evt["params"] = params;
-                        Json::StreamWriterBuilder wb;
-                        wb["indentation"] = "";
-                        strongThis->ProtocolVtSequenceReceived.raise(
-                            *strongThis,
-                            winrt::to_hstring(Json::writeString(wb, evt)));
                     }
+
+                    // Dispatch to UI thread: _FindPaneIdForControl accesses _tabs.
+                    strongThis->Dispatcher().RunAsync(
+                        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+                        [weakThis, weakTerm, stateStr]() {
+                            auto page = weakThis.get();
+                            auto term2 = weakTerm.get();
+                            if (!page)
+                                return;
+
+                            const auto paneIdStr = term2
+                                ? page->_FindPaneIdForControl(term2)
+                                : std::string{};
+                            if (paneIdStr.empty())
+                                return;
+
+                            Json::Value evt;
+                            evt["type"] = "event";
+                            evt["method"] = "connection_state";
+                            Json::Value params;
+                            params["pane_id"] = paneIdStr;
+                            params["state"] = stateStr;
+                            evt["params"] = params;
+                            Json::StreamWriterBuilder wb;
+                            wb["indentation"] = "";
+                            page->ProtocolVtSequenceReceived.raise(
+                                *page,
+                                winrt::to_hstring(Json::writeString(wb, evt)));
+                        });
                 });
         }
 

@@ -449,6 +449,7 @@
   <Folder Name="/Terminal/">
     <Project Path="src/cascadia/CascadiaPackage/CascadiaPackage.wapproj" Type="c7167f0d-bc9f-4e6e-afe1-012c56b48db5">
       <BuildDependency Project="src/cascadia/ShellExtension/WindowsTerminalShellExt.vcxproj" />
+      <BuildDependency Project="src/tools/wtcli/wtcli.vcxproj" />
       <BuildType Solution="AuditMode|Any CPU" Project="Debug" />
       <BuildType Solution="AuditMode|ARM64" Project="Release" />
       <BuildType Solution="AuditMode|x64" Project="Release" />
@@ -1057,4 +1058,5 @@
       <Build Solution="Fuzzing|x86" Project="false" />
     </Project>
   </Folder>
+  <Project Path="src/tools/wtcli/wtcli.vcxproj" Id="8a3b5e2f-1c4d-4f6a-9b8c-0d1e2f3a4b5c" />
 </Solution>

@@ -924,37 +924,21 @@ fn run_set_env(po: &PipeOverride, shell_type: &str) -> Result<()> {
 
 async fn run_listen(po: &PipeOverride, pane_filter: Option<&str>) -> Result<()> {
     let channel = connect_channel(po).await?;
+    let arc_channel = std::sync::Arc::new(channel);
+
+    // Subscribe to events and start the background reader.
+    let mut event_rx = arc_channel.subscribe_events();
+    arc_channel.start_reader().await;
 
     // Send any request to trigger lazy page event registration on the server.
-    // The server registers for VT events on the first authenticated request.
-    let _ = channel.request("get_capabilities", json!({})).await;
+    let _ = arc_channel.request("get_capabilities", json!({})).await;
 
     eprintln!("Connected. Listening for events... (Ctrl+C to stop)");
     if let Some(pane) = pane_filter {
         eprintln!("Filtering: pane_id={}", pane);
     }
 
-    loop {
-        let line = match channel.read_line().await {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!("Pipe closed: {}", e);
-                break;
-            }
-        };
-
-        // Skip empty lines.
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        // Parse JSON. Skip lines that aren't valid JSON.
-        let msg: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
+    while let Some(msg) = event_rx.recv().await {
         // Only print events, skip responses.
         if msg.get("type").and_then(|v| v.as_str()) != Some("event") {
             continue;
@@ -975,6 +959,7 @@ async fn run_listen(po: &PipeOverride, pane_filter: Option<&str>) -> Result<()> 
         println!("{}", serde_json::to_string(&msg).unwrap_or_default());
     }
 
+    eprintln!("Event stream closed.");
     Ok(())
 }
 
@@ -1422,6 +1407,7 @@ async fn run_info_mode(po: &PipeOverride) -> Result<()> {
     let source_str = match info.source {
         DiscoverySource::VtOsc => "VT OSC discovery",
         DiscoverySource::EnvVar => "WT_PIPE_NAME env var",
+        DiscoverySource::ComClsid => "WT_COM_CLSID env var",
     };
     let token_display = if info.token.is_empty() {
         "(dev bypass)"

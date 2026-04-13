@@ -2,11 +2,11 @@
 // Licensed under the MIT license.
 //
 // This file contains the protocol bridge methods for TerminalPage.
-// These methods are called by the TerminalProtocolServer to query
-// and mutate terminal state. They return JSON strings to avoid
-// complex WinRT type definitions across the DLL boundary.
+// These methods are called by the TerminalProtocolComServer to query
+// and mutate terminal state. They return typed WinRT structs across
+// the DLL boundary.
 //
-// IMPORTANT: These methods are called from background threads (pipe I/O).
+// IMPORTANT: These methods are called from background threads (COM).
 // All access to UI state must be marshaled to the UI thread via Dispatcher().
 
 #include "pch.h"
@@ -106,7 +106,7 @@ namespace winrt::TerminalApp::implementation
     }
 
     // Helper to get PID from a pane's terminal control connection.
-    static Json::UInt _getPidFromPane(const std::shared_ptr<Pane>& pane)
+    static uint32_t _getPidFromPane(const std::shared_ptr<Pane>& pane)
     {
         if (const auto termControl = pane->GetTerminalControl())
         {
@@ -118,7 +118,7 @@ namespace winrt::TerminalApp::implementation
                     const auto handle = conpty.RootProcessHandle();
                     if (handle)
                     {
-                        return static_cast<Json::UInt>(GetProcessId(reinterpret_cast<HANDLE>(handle)));
+                        return static_cast<uint32_t>(GetProcessId(reinterpret_cast<HANDLE>(handle)));
                     }
                 }
             }
@@ -145,55 +145,48 @@ namespace winrt::TerminalApp::implementation
         });
     }
 
-    hstring TerminalPage::GetProtocolActivePaneJson()
+    // ============================================================================
+    // Queries — return typed WinRT structs
+    // ============================================================================
+
+    TerminalApp::ProtocolPaneInfo TerminalPage::GetProtocolActivePane()
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
+        return _runOnUIThread(*this, [&]() -> TerminalApp::ProtocolPaneInfo {
+            TerminalApp::ProtocolPaneInfo result{};
+
             const auto focusedTabIdx = _GetFocusedTabIndex();
             if (!focusedTabIdx.has_value())
-            {
-                return L"";
-            }
+                return result;
 
             const auto tab = _tabs.GetAt(focusedTabIdx.value());
             const auto tabImpl = _GetTabImpl(tab);
             if (!tabImpl)
-            {
-                return L"";
-            }
+                return result;
 
             const auto activePane = tabImpl->GetActivePane();
             if (!activePane)
-            {
-                return L"";
-            }
+                return result;
 
-            Json::Value result;
-            result["pane_id"] = std::to_string(activePane->ContentId().value());
-            result["tab_id"] = std::to_string(focusedTabIdx.value());
+            result.PaneId = winrt::to_hstring(std::to_string(activePane->ContentId().value()));
+            result.TabId = winrt::to_hstring(std::to_string(focusedTabIdx.value()));
+            result.IsActive = true;
 
             if (const auto termContent = activePane->GetContent().try_as<TerminalApp::TerminalPaneContent>())
             {
-                result["title"] = winrt::to_string(termContent.Title());
+                result.Title = termContent.Title();
                 const auto profile = termContent.GetProfile();
-                result["profile"] = profile ? winrt::to_string(profile.Name()) : "";
+                result.Profile = profile ? profile.Name() : L"";
             }
 
-            const auto pid = _getPidFromPane(activePane);
-            if (pid != 0)
-            {
-                result["pid"] = pid;
-            }
-
-            Json::StreamWriterBuilder writerBuilder;
-            writerBuilder["indentation"] = "";
-            return winrt::to_hstring(Json::writeString(writerBuilder, result));
+            result.Pid = _getPidFromPane(activePane);
+            return result;
         });
     }
 
-    hstring TerminalPage::GetProtocolTabsJson()
+    Windows::Foundation::Collections::IVector<TerminalApp::ProtocolTabInfo> TerminalPage::GetProtocolTabs()
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
-            Json::Value tabs(Json::arrayValue);
+        return _runOnUIThread(*this, [&]() -> Windows::Foundation::Collections::IVector<TerminalApp::ProtocolTabInfo> {
+            auto tabs = winrt::single_threaded_vector<TerminalApp::ProtocolTabInfo>();
             const auto focusedIdx = _GetFocusedTabIndex();
 
             for (uint32_t i = 0; i < _tabs.Size(); ++i)
@@ -201,169 +194,128 @@ namespace winrt::TerminalApp::implementation
                 const auto tab = _tabs.GetAt(i);
                 const auto tabImpl = _GetTabImpl(tab);
                 if (!tabImpl)
-                {
                     continue;
-                }
 
-                Json::Value t;
-                t["tab_id"] = std::to_string(i);
-                t["title"] = winrt::to_string(tab.Title());
-                t["is_active"] = focusedIdx.has_value() && (focusedIdx.value() == i);
-                t["pane_count"] = tabImpl->GetLeafPaneCount();
-                tabs.append(t);
+                TerminalApp::ProtocolTabInfo info{};
+                info.TabId = winrt::to_hstring(std::to_string(i));
+                info.Title = tab.Title();
+                info.IsActive = focusedIdx.has_value() && (focusedIdx.value() == i);
+                info.PaneCount = tabImpl->GetLeafPaneCount();
+                tabs.Append(info);
             }
 
-            Json::StreamWriterBuilder writerBuilder;
-            writerBuilder["indentation"] = "";
-            return winrt::to_hstring(Json::writeString(writerBuilder, tabs));
+            return tabs;
         });
     }
 
-    hstring TerminalPage::GetProtocolPanesJson(hstring tabIdFilter)
+    Windows::Foundation::Collections::IVector<TerminalApp::ProtocolPaneInfo> TerminalPage::GetProtocolPanes(hstring tabIdFilter)
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
-            Json::Value panes(Json::arrayValue);
+        return _runOnUIThread(*this, [&]() -> Windows::Foundation::Collections::IVector<TerminalApp::ProtocolPaneInfo> {
+            auto panes = winrt::single_threaded_vector<TerminalApp::ProtocolPaneInfo>();
             const auto tabIdFilterStr = winrt::to_string(tabIdFilter);
 
             for (uint32_t tabIdx = 0; tabIdx < _tabs.Size(); ++tabIdx)
             {
                 const auto tabIdStr = std::to_string(tabIdx);
                 if (!tabIdFilterStr.empty() && tabIdStr != tabIdFilterStr)
-                {
                     continue;
-                }
 
                 const auto tab = _tabs.GetAt(tabIdx);
                 const auto tabImpl = _GetTabImpl(tab);
                 if (!tabImpl)
-                {
                     continue;
-                }
 
                 const auto rootPane = tabImpl->GetRootPane();
                 if (!rootPane)
-                {
                     continue;
-                }
 
                 const auto activePane = tabImpl->GetActivePane();
 
                 rootPane->WalkTree([&](const auto& pane) {
                     if (!pane->GetContent())
-                    {
                         return; // Skip branch nodes
-                    }
 
-                    Json::Value p;
-                    p["pane_id"] = std::to_string(pane->ContentId().value());
-                    p["tab_id"] = tabIdStr;
+                    TerminalApp::ProtocolPaneInfo info{};
+                    info.PaneId = winrt::to_hstring(std::to_string(pane->ContentId().value()));
+                    info.TabId = winrt::to_hstring(tabIdStr);
+                    info.IsActive = (activePane == pane);
+                    info.Pid = _getPidFromPane(pane);
 
                     if (const auto termContent = pane->GetContent().try_as<TerminalApp::TerminalPaneContent>())
                     {
-                        p["title"] = winrt::to_string(termContent.Title());
+                        info.Title = termContent.Title();
                         const auto profile = termContent.GetProfile();
-                        p["profile"] = profile ? winrt::to_string(profile.Name()) : "";
+                        info.Profile = profile ? profile.Name() : L"";
 
                         if (const auto termControl = pane->GetTerminalControl())
                         {
-                            p["size"]["rows"] = termControl.ViewHeight();
-                            p["size"]["columns"] = 0;
+                            info.Rows = termControl.ViewHeight();
+                            info.Columns = 0;
                         }
                     }
                     else
                     {
-                        p["title"] = winrt::to_string(pane->GetContent().Title());
-                        p["profile"] = "";
+                        info.Title = pane->GetContent().Title();
+                        info.Profile = L"";
                     }
 
-                    p["is_active"] = (activePane == pane);
-
-                    const auto pid = _getPidFromPane(pane);
-                    if (pid != 0)
-                    {
-                        p["pid"] = pid;
-                    }
-                    else
-                    {
-                        p["pid"] = Json::nullValue;
-                    }
-                    p["process"] = "";
-
-                    panes.append(p);
+                    panes.Append(info);
                 });
             }
 
-            Json::StreamWriterBuilder writerBuilder;
-            writerBuilder["indentation"] = "";
-            return winrt::to_hstring(Json::writeString(writerBuilder, panes));
+            return panes;
         });
     }
 
-    hstring TerminalPage::ReadProtocolPaneOutput(hstring paneId, hstring source, int32_t maxLines)
+    TerminalApp::ProtocolPaneOutput TerminalPage::ReadProtocolPaneOutput(hstring paneId, hstring source, int32_t maxLines)
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
+        return _runOnUIThread(*this, [&]() -> TerminalApp::ProtocolPaneOutput {
+            TerminalApp::ProtocolPaneOutput result{};
             const auto paneIdVal = static_cast<uint32_t>(std::stoul(winrt::to_string(paneId)));
             const auto sourceStr = winrt::to_string(source);
             if (maxLines <= 0)
-            {
                 maxLines = 200;
-            }
 
             for (uint32_t tabIdx = 0; tabIdx < _tabs.Size(); ++tabIdx)
             {
                 const auto tabImpl = _GetTabImpl(_tabs.GetAt(tabIdx));
                 if (!tabImpl)
-                {
                     continue;
-                }
 
                 const auto rootPane = tabImpl->GetRootPane();
                 if (!rootPane)
-                {
                     continue;
-                }
 
                 const auto foundPane = rootPane->FindPaneByContentId(paneIdVal);
                 if (!foundPane)
-                {
                     continue;
-                }
 
                 const auto termControl = foundPane->GetTerminalControl();
                 if (!termControl)
-                {
-                    return L"";
-                }
+                    return result; // empty PaneId signals not-ready
 
-                std::string fullBuffer;
+                hstring fullBuffer;
                 try
                 {
-                    fullBuffer = winrt::to_string(termControl.ReadEntireBuffer());
+                    fullBuffer = termControl.ReadEntireBuffer();
                 }
                 catch (...)
                 {
-                    Json::Value err;
-                    err["pane_id"] = winrt::to_string(paneId);
-                    err["error"] = "Terminal not yet initialized. Try again shortly.";
-                    Json::StreamWriterBuilder wb;
-                    wb["indentation"] = "";
-                    return winrt::to_hstring(Json::writeString(wb, err));
+                    return result; // empty PaneId signals error
                 }
 
+                auto fullBufferStr = winrt::to_string(fullBuffer);
                 std::vector<std::string> lines;
-                std::istringstream iss(fullBuffer);
+                std::istringstream iss(fullBufferStr);
                 std::string line;
                 while (std::getline(iss, line))
                 {
                     if (!line.empty() && line.back() == '\r')
-                    {
                         line.pop_back();
-                    }
                     lines.push_back(line);
                 }
 
-                Json::Value result;
-                result["pane_id"] = winrt::to_string(paneId);
+                result.PaneId = paneId;
 
                 if (sourceStr == "screen")
                 {
@@ -382,9 +334,9 @@ namespace winrt::TerminalApp::implementation
                         lineCount++;
                     }
 
-                    result["content"] = content;
-                    result["line_count"] = lineCount;
-                    result["truncated"] = false;
+                    result.Content = winrt::to_hstring(content);
+                    result.LineCount = lineCount;
+                    result.Truncated = false;
                 }
                 else
                 {
@@ -401,23 +353,22 @@ namespace winrt::TerminalApp::implementation
                         lineCount++;
                     }
 
-                    result["content"] = content;
-                    result["line_count"] = lineCount;
-                    result["truncated"] = truncated;
+                    result.Content = winrt::to_hstring(content);
+                    result.LineCount = lineCount;
+                    result.Truncated = truncated;
                 }
 
-                Json::StreamWriterBuilder writerBuilder;
-                writerBuilder["indentation"] = "";
-                return winrt::to_hstring(Json::writeString(writerBuilder, result));
+                return result;
             }
 
-            return L"";
+            return result; // empty PaneId = not found
         });
     }
 
-    hstring TerminalPage::GetProtocolProcessStatus(hstring paneId)
+    TerminalApp::ProtocolProcessStatus TerminalPage::GetProtocolProcessStatus(hstring paneId)
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
+        return _runOnUIThread(*this, [&]() -> TerminalApp::ProtocolProcessStatus {
+            TerminalApp::ProtocolProcessStatus result{};
             const auto paneIdVal = static_cast<uint32_t>(std::stoul(winrt::to_string(paneId)));
 
             for (uint32_t tabIdx = 0; tabIdx < _tabs.Size(); ++tabIdx)
@@ -434,41 +385,32 @@ namespace winrt::TerminalApp::implementation
                 if (!foundPane)
                     continue;
 
-                Json::Value result;
-                result["pane_id"] = winrt::to_string(paneId);
+                result.PaneId = paneId;
 
                 const auto termControl = foundPane->GetTerminalControl();
                 if (!termControl)
                 {
-                    result["state"] = "unknown";
-                    Json::StreamWriterBuilder writerBuilder;
-                    writerBuilder["indentation"] = "";
-                    return winrt::to_hstring(Json::writeString(writerBuilder, result));
+                    result.State = L"unknown";
+                    return result;
                 }
 
                 const auto conn = termControl.Connection();
                 if (!conn)
                 {
-                    result["state"] = "exited";
-                    result["exit_code"] = Json::nullValue;
-                    result["pid"] = Json::nullValue;
-                    Json::StreamWriterBuilder writerBuilder;
-                    writerBuilder["indentation"] = "";
-                    return winrt::to_hstring(Json::writeString(writerBuilder, result));
+                    result.State = L"exited";
+                    return result;
                 }
 
                 const auto connState = termControl.ConnectionState();
 
                 if (connState == ConnectionState::Connected)
                 {
-                    result["state"] = "running";
-                    const auto pid = _getPidFromPane(foundPane);
-                    if (pid != 0)
-                        result["pid"] = pid;
+                    result.State = L"running";
+                    result.Pid = _getPidFromPane(foundPane);
                 }
                 else
                 {
-                    result["state"] = "exited";
+                    result.State = L"exited";
                     if (const auto conpty = conn.try_as<ConptyConnection>())
                     {
                         const auto handle = conpty.RootProcessHandle();
@@ -478,27 +420,27 @@ namespace winrt::TerminalApp::implementation
                             if (GetExitCodeProcess(reinterpret_cast<HANDLE>(handle), &exitCode))
                             {
                                 if (exitCode != STILL_ACTIVE)
-                                    result["exit_code"] = static_cast<Json::Int>(exitCode);
+                                {
+                                    result.ExitCode = static_cast<int32_t>(exitCode);
+                                    result.HasExitCode = true;
+                                }
                             }
-                            const auto pid = GetProcessId(reinterpret_cast<HANDLE>(handle));
-                            if (pid != 0)
-                                result["pid"] = static_cast<Json::UInt>(pid);
+                            result.Pid = static_cast<uint32_t>(GetProcessId(reinterpret_cast<HANDLE>(handle)));
                         }
                     }
                 }
 
-                Json::StreamWriterBuilder writerBuilder;
-                writerBuilder["indentation"] = "";
-                return winrt::to_hstring(Json::writeString(writerBuilder, result));
+                return result;
             }
 
-            return L"";
+            return result; // empty PaneId = not found
         });
     }
 
-    hstring TerminalPage::GetProtocolSessionVariable(hstring paneId, hstring name)
+    TerminalApp::ProtocolSessionVariable TerminalPage::GetProtocolSessionVariable(hstring paneId, hstring name)
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
+        return _runOnUIThread(*this, [&]() -> TerminalApp::ProtocolSessionVariable {
+            TerminalApp::ProtocolSessionVariable result{};
             const auto paneIdVal = static_cast<uint32_t>(std::stoul(winrt::to_string(paneId)));
 
             for (uint32_t tabIdx = 0; tabIdx < _tabs.Size(); ++tabIdx)
@@ -515,30 +457,31 @@ namespace winrt::TerminalApp::implementation
                 if (!foundPane)
                     continue;
 
-                Json::Value result;
-                result["pane_id"] = winrt::to_string(paneId);
-                result["name"] = winrt::to_string(name);
+                result.PaneId = paneId;
+                result.Name = name;
 
                 const auto value = foundPane->GetSessionVariable(name);
                 if (value.has_value())
                 {
-                    result["value"] = winrt::to_string(value.value());
-                    result["exists"] = true;
+                    result.Value = value.value();
+                    result.Exists = true;
                 }
                 else
                 {
-                    result["value"] = Json::nullValue;
-                    result["exists"] = false;
+                    result.Value = L"";
+                    result.Exists = false;
                 }
 
-                Json::StreamWriterBuilder writerBuilder;
-                writerBuilder["indentation"] = "";
-                return winrt::to_hstring(Json::writeString(writerBuilder, result));
+                return result;
             }
 
-            return L"";
+            return result; // empty PaneId = not found
         });
     }
+
+    // ============================================================================
+    // Mutations — return typed structs or bool
+    // ============================================================================
 
     bool TerminalPage::SetProtocolSessionVariable(hstring paneId, hstring name, hstring value)
     {
@@ -588,67 +531,46 @@ namespace winrt::TerminalApp::implementation
         });
     }
 
-    void TerminalPage::InitializeCoordinator(NewTerminalArgs /*args*/)
+    TerminalApp::ProtocolCreationResult TerminalPage::CreateProtocolTab(NewTerminalArgs args, bool background)
     {
-        // Stub: coordinator initialization not yet implemented.
-    }
+        return _runOnUIThread(*this, [&]() -> TerminalApp::ProtocolCreationResult {
+            TerminalApp::ProtocolCreationResult result{};
 
-    void TerminalPage::ToggleCoordinator()
-    {
-        _runOnUIThreadVoid(*this, [&]() {
-            _OpenOrReuseAgentPane(L"");
-        });
-    }
-
-    hstring TerminalPage::CreateProtocolTab(NewTerminalArgs args, bool background)
-    {
-        return _runOnUIThread(*this, [&]() -> hstring {
             auto pane = _MakePane(args, nullptr);
             _pendingProtocolEnvVars.reset();
             if (!pane)
-            {
-                return L"";
-            }
+                return result;
 
             _CreateNewTabFromPane(pane, -1, /*openInBackground=*/background);
             _tabContent.UpdateLayout(); // Force synchronous terminal initialization
 
             if (_tabs.Size() == 0)
-            {
-                return L"";
-            }
+                return result;
 
             const auto newTabIdx = _tabs.Size() - 1;
             const auto newTab = _tabs.GetAt(newTabIdx);
             const auto tabImpl = _GetTabImpl(newTab);
 
-            Json::Value result;
-            result["tab_id"] = std::to_string(newTabIdx);
+            result.TabId = winrt::to_hstring(std::to_string(newTabIdx));
 
             if (tabImpl)
             {
                 const auto rootPane = tabImpl->GetRootPane();
                 if (rootPane)
                 {
-                    result["pane_id"] = std::to_string(rootPane->ContentId().value());
-
-                    const auto pid = _getPidFromPane(rootPane);
-                    if (pid != 0)
-                    {
-                        result["pid"] = pid;
-                    }
+                    result.PaneId = winrt::to_hstring(std::to_string(rootPane->ContentId().value()));
+                    result.Pid = _getPidFromPane(rootPane);
                 }
             }
 
-            Json::StreamWriterBuilder writerBuilder;
-            writerBuilder["indentation"] = "";
-            return winrt::to_hstring(Json::writeString(writerBuilder, result));
+            return result;
         });
     }
 
-    hstring TerminalPage::SplitProtocolPane(hstring paneId, SplitDirection direction, float size, NewTerminalArgs args, bool background)
+    TerminalApp::ProtocolCreationResult TerminalPage::SplitProtocolPane(hstring paneId, SplitDirection direction, float size, NewTerminalArgs args, bool background)
     {
-        return _runOnUIThread(*this, [&]() -> hstring {
+        return _runOnUIThread(*this, [&]() -> TerminalApp::ProtocolCreationResult {
+            TerminalApp::ProtocolCreationResult result{};
             const auto paneIdVal = static_cast<uint32_t>(std::stoul(winrt::to_string(paneId)));
 
             for (uint32_t tabIdx = 0; tabIdx < _tabs.Size(); ++tabIdx)
@@ -674,9 +596,7 @@ namespace winrt::TerminalApp::implementation
                 auto newPane = _MakePane(args, nullptr);
                 _pendingProtocolEnvVars.reset();
                 if (!newPane)
-                {
-                    return L"";
-                }
+                    return result;
 
                 // Capture new pane info before moving it into the split.
                 const auto newPaneContentId = newPane->ContentId().value();
@@ -685,21 +605,14 @@ namespace winrt::TerminalApp::implementation
                 _SplitPane(tabImpl, direction, size, std::move(newPane), /*focusNewPane=*/!background);
                 _tabContent.UpdateLayout(); // Force synchronous terminal initialization
 
-                Json::Value result;
-                result["tab_id"] = std::to_string(tabIdx);
-                result["pane_id"] = std::to_string(newPaneContentId);
-                if (newPanePid != 0)
-                {
-                    result["pid"] = newPanePid;
-                }
-
-                Json::StreamWriterBuilder writerBuilder;
-                writerBuilder["indentation"] = "";
-                return winrt::to_hstring(Json::writeString(writerBuilder, result));
+                result.TabId = winrt::to_hstring(std::to_string(tabIdx));
+                result.PaneId = winrt::to_hstring(std::to_string(newPaneContentId));
+                result.Pid = newPanePid;
+                return result;
             }
 
             _pendingProtocolEnvVars.reset();
-            return L"";
+            return result;
         });
     }
 
@@ -765,6 +678,10 @@ namespace winrt::TerminalApp::implementation
         });
     }
 
+    // ============================================================================
+    // QuickPick — still uses JSON for the choices parameter (UI-facing, not IPC)
+    // ============================================================================
+
     hstring TerminalPage::ShowProtocolQuickPick(hstring /*title*/, hstring choicesJson, bool /*allowFreeInput*/)
     {
         // Parse choices on the calling (I/O) thread — no UI needed.
@@ -811,7 +728,9 @@ namespace winrt::TerminalApp::implementation
 
                 // Subscribe to QuickPickCompleted for the selection path.
                 // The event fires BEFORE _close() in _dispatchQuickPick,
-                // so we can set the result and signal the I/O thread directly.
+                // so we store the result here but defer signaling to the
+                // Visibility→Collapsed callback to ensure the caller sees
+                // the result only after the palette has fully closed.
                 auto qpToken = std::make_shared<winrt::event_token>();
                 *qpToken = palette.QuickPickCompleted(
                     [state, weakThis, qpToken](auto&&, const winrt::hstring& selectedName) {
@@ -822,7 +741,6 @@ namespace winrt::TerminalApp::implementation
                         Json::StreamWriterBuilder wb;
                         wb["indentation"] = "";
                         state->result = winrt::to_hstring(Json::writeString(wb, result));
-                        SetEvent(state->completedEvent);
                     });
 
                 // Visibility callback handles cancellation (Escape / click-away)
@@ -856,16 +774,113 @@ namespace winrt::TerminalApp::implementation
                         if (state->result.empty())
                         {
                             state->result = winrt::to_hstring("{\"cancelled\":true,\"selected\":\"\"}");
-                            SetEvent(state->completedEvent);
                         }
+                        // Always signal after the palette has fully collapsed.
+                        SetEvent(state->completedEvent);
                     });
 
                 palette.Visibility(winrt::Windows::UI::Xaml::Visibility::Visible);
             });
 
-        // Block the pipe I/O thread until the palette completes.
+        // Block the I/O thread until the palette completes.
         WaitForSingleObject(state->completedEvent, INFINITE);
         CloseHandle(state->completedEvent);
         return state->result;
+    }
+
+    // ============================================================================
+    // Coordinator
+    // ============================================================================
+
+    void TerminalPage::InitializeCoordinator(NewTerminalArgs args)
+    {
+        _runOnUIThreadVoid(*this, [&]() {
+            if (_coordinatorInitialized)
+            {
+                return;
+            }
+
+            // Resolve the profile and create terminal settings.
+            const auto profile = _settings.GetProfileForArgs(args);
+            const auto controlSettings = winrt::Microsoft::Terminal::Settings::TerminalSettings::CreateWithNewTerminalArgs(_settings, args);
+
+            // Create the connection (this picks up _pendingProtocolEnvVars).
+            auto connection = _CreateConnectionFromSettings(profile, *controlSettings.DefaultSettings(), false);
+            _pendingProtocolEnvVars.reset();
+
+            // Create the TermControl.
+            _coordinatorControl = _CreateNewControlAndContent(controlSettings, connection);
+
+            // Host the control in the sidecar container.
+            CoordinatorContainer().Children().Clear();
+            CoordinatorContainer().Children().Append(_coordinatorControl);
+
+            _coordinatorInitialized = true;
+        });
+    }
+
+    void TerminalPage::ToggleCoordinator()
+    {
+        _runOnUIThreadVoid(*this, [&]() {
+            // Lazily initialize the coordinator panel if it hasn't been set up yet.
+            // This allows the toggle command to work even when the coordinator
+            // wasn't started automatically (e.g. no commandline configured).
+            if (!_coordinatorInitialized)
+            {
+                const auto& globals = _settings.GlobalSettings();
+                auto commandline = std::wstring{ globals.AiCoordinatorCommandline() };
+
+                // Fall back to the default shell if no coordinator CLI is configured.
+                if (commandline.empty())
+                {
+                    commandline = L"cmd.exe";
+                }
+
+                NewTerminalArgs newTermArgs;
+                newTermArgs.Commandline(winrt::hstring{ commandline });
+
+                const auto profile = globals.AiCoordinatorProfile();
+                if (!profile.empty())
+                {
+                    newTermArgs.Profile(profile);
+                }
+
+                newTermArgs.TabTitle(L"AI Assistant");
+                newTermArgs.SuppressApplicationTitle(true);
+
+                InitializeCoordinator(newTermArgs);
+            }
+
+            const auto border = CoordinatorBorder();
+            if (border.Visibility() == winrt::Windows::UI::Xaml::Visibility::Visible)
+            {
+                border.Visibility(winrt::Windows::UI::Xaml::Visibility::Collapsed);
+                // Return focus to the active pane in the current tab.
+                if (const auto tab = _GetFocusedTab())
+                {
+                    tab.Focus(winrt::Windows::UI::Xaml::FocusState::Programmatic);
+                }
+            }
+            else
+            {
+                border.Visibility(winrt::Windows::UI::Xaml::Visibility::Visible);
+                // Focus the coordinator when showing it.
+                if (_coordinatorControl)
+                {
+                    _coordinatorControl.Focus(winrt::Windows::UI::Xaml::FocusState::Programmatic);
+                }
+            }
+        });
+    }
+
+    bool TerminalPage::CoordinatorVisible()
+    {
+        return _runOnUIThread(*this, [&]() -> bool {
+            if (!_coordinatorInitialized)
+            {
+                return false;
+            }
+            return CoordinatorBorder().Visibility() == winrt::Windows::UI::Xaml::Visibility::Visible;
+        });
     }
 }

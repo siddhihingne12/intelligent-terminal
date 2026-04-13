@@ -20,6 +20,7 @@ Abstract:
 class AppHost;
 class TerminalProtocolServer;
 class ProtocolRequestHandler;
+struct TerminalProtocolComServer;
 
 class WindowEmperor
 {
@@ -46,6 +47,9 @@ public:
     // Protocol server access
     const std::wstring& GetProtocolPipeName() const noexcept { return _protocolPipeName; }
     const std::string& GetMcpToken() const noexcept { return _mcpToken; }
+    const std::wstring& GetComClsid() const noexcept { return _comClsid; }
+    const std::vector<std::shared_ptr<::AppHost>>& GetWindows() const noexcept { return _windows; }
+    AppHost* GetMostRecentWindow() const noexcept { return _mostRecentWindow(); }
 
 private:
     struct SummonWindowSelectionArgs
@@ -87,6 +91,7 @@ private:
     // Protocol server for AI CLI integration
     std::wstring _protocolPipeName;
     std::string _mcpToken;
+    std::wstring _comClsid; // Stringified CLSID for WT_COM_CLSID env var
     std::unique_ptr<ProtocolRequestHandler> _protocolHandler;
     std::unique_ptr<TerminalProtocolServer> _protocolServer;
     void _initializeProtocolServer();

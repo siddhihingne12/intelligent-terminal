@@ -202,6 +202,8 @@
                 <com:Interface Id="E686C757-9A35-4A1C-B3CE-0BCC8B5C69F4" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/>
                 <com:Interface Id="6F23DA90-15C5-4203-9DB0-64E73F1B1B00" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/> <!-- ITerminalHandoff3 -->
                 <com:Interface Id="746E6BC0-AB05-4E38-AB14-71E86763141F" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/>
+                <com:Interface Id="7B3F8A1E-5C2D-4E6F-9A8B-1D3E5F7A9B0C" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/> <!-- ITerminalProtocolServer -->
+                <com:Interface Id="539A9320-4CD2-4B59-8759-7E361EC9E7EA" ProxyStubClsid="3171DE52-6EFA-4AEF-8A9F-D02BD67E7A4F"/> <!-- ITerminalEventCallback -->
             </com:ComInterface>
         </com:Extension>
         <com:Extension Category="windows.comServer">
@@ -211,6 +213,7 @@
                 </com:ExeServer>
                 <com:ExeServer DisplayName="WindowsTerminal" Executable="WindowsTerminal.exe">
                     <com:Class Id="E12CFF52-A866-4C77-9A90-F570A7AA2C6B"/>
+                    <com:Class Id="A2E4F6B8-1C3D-4E5F-A6B7-C8D9E0F1A2B3"/> <!-- TerminalProtocolComServer (Release) -->
                 </com:ExeServer>
                 <com:SurrogateServer DisplayName="WindowsTerminalShellExt">
                     <com:Class Id="9f156763-7844-4dc4-b2b1-901f640f5155" Path="WindowsTerminalShellExt.dll" ThreadingModel="STA"/>

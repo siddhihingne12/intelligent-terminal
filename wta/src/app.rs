@@ -821,6 +821,10 @@ impl App {
                     }
                     WtEventSeverity::Actionable => {
                         if method == "agent_prompt" {
+                            if self.shared_mode {
+                                autofix_log("shared_mode: ignoring agent_prompt event (host handles delegation)");
+                                return;
+                            }
                             // Command palette prompt: delegate directly to a new tab agent.
                             // No UI feedback in agent pane — it stays hidden.
                             let prompt = params
@@ -828,6 +832,7 @@ impl App {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            autofix_log(&format!("agent_prompt: delegating, prompt_len={}", prompt.len()));
                             if !prompt.is_empty() {
                                 self.delegate_to_tab_agent(&prompt, None);
                             }
@@ -1232,6 +1237,7 @@ impl App {
     /// This is the same path used by the command palette — single code path for
     /// context capture, prompt building, and tab creation.
     pub fn delegate_to_tab_agent(&self, prompt: &str, source_pane_id: Option<&str>) {
+        autofix_log(&format!("delegate_to_tab_agent called, prompt_len={}, shared_mode={}", prompt.len(), self.shared_mode));
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(_) => return,

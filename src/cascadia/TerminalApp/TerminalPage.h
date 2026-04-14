@@ -297,6 +297,16 @@ namespace winrt::TerminalApp::implementation
         // Expired entries are pruned lazily during lookup.
         std::vector<std::weak_ptr<Pane>> _agentPanes;
 
+        // Pane that was focused before the agent pane was shown, so we can
+        // restore focus on toggle-off.
+        std::optional<uint32_t> _priorPaneId;
+
+        // Shared agent host process — started once, persists for the session.
+        bool _agentHostStarted{ false };
+        HANDLE _agentHostProcess{ nullptr };
+        void _EnsureAgentHostStarted();
+        void _AutoCreateHiddenAgentPane(winrt::com_ptr<Tab> tab);
+
         winrt::Windows::UI::Xaml::Controls::TextBox::LayoutUpdated_revoker _renamerLayoutUpdatedRevoker;
         int _renamerLayoutCount{ 0 };
         bool _renamerPressedEnter{ false };

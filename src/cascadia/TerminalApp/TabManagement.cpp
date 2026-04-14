@@ -205,6 +205,26 @@ namespace winrt::TerminalApp::implementation
             content.IsHitTestVisible(false);
             _tabContent.Children().Append(content);
         }
+
+        // Auto-create a hidden agent pane so WTA is always running in the
+        // background, receiving events and processing autofix silently.
+        // Ctrl+Shift+. toggles visibility of this pane.
+        //
+        // Deferred via Dispatcher so it runs after the current tab creation
+        // completes — calling it synchronously inside _InitializeTab would
+        // interfere with COM callers (CreateProtocolTab) that are blocking
+        // on the result, causing spurious 0x8007023E errors.
+        auto weakSelf = get_weak();
+        auto weakAgentTab = make_weak(newTabImpl);
+        Dispatcher().RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Low,
+            [weakSelf, weakAgentTab]() {
+                auto self = weakSelf.get();
+                auto tab = weakAgentTab.get();
+                if (self && tab)
+                {
+                    self->_AutoCreateHiddenAgentPane(tab);
+                }
+            });
     }
 
     // Method Description:

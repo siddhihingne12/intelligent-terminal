@@ -586,6 +586,9 @@ async fn run_attach_client_inner(
                     "attach_client_send",
                     &format!("preview={:?}", prompt.preview()),
                 );
+                // Use the prompt's own pane_context (e.g. autofix sets
+                // source_pane_id), falling back to the attach context.
+                let effective_context = prompt.pane_context.unwrap_or_else(|| pane_context.clone());
                 send_host_request(
                     &event_tx,
                     &debug_capture_enabled,
@@ -594,7 +597,7 @@ async fn run_attach_client_inner(
                         prompt_id: prompt.id,
                         submitted_at_unix_s: prompt.submitted_at_unix_s,
                         text: prompt.text,
-                        pane_context: Some(pane_context.clone()),
+                        pane_context: Some(effective_context),
                     },
                 ).await?;
             }
@@ -929,7 +932,31 @@ fn handle_host_command(
                     .and_then(|set| set.choices.iter().find(|item| item.choice == choice))
                     .cloned();
 
-                if let Some(selected) = maybe_choice {
+                if let Some(mut selected) = maybe_choice {
+                    // Auto-fill empty `parent` on Send actions from the
+                    // submitting client's pane context (needed for auto-fix
+                    // where the failing pane ID is only known client-side).
+                    let source_pane = clients
+                        .get(&client_id)
+                        .and_then(|c| c.pane_context.source_pane_id.clone())
+                        .or_else(|| {
+                            clients
+                                .get(&client_id)
+                                .and_then(|c| c.pane_context.pane_id.clone())
+                        });
+                    if let Some(ref pane_id) = source_pane {
+                        for action in &mut selected.actions {
+                            if let crate::coordinator::RecommendedAction::Send {
+                                ref mut parent, ..
+                            } = action
+                            {
+                                if parent.is_empty() {
+                                    *parent = pane_id.clone();
+                                }
+                            }
+                        }
+                    }
+
                     state.commit_pending_completed_turn();
                     state.clear_recommendations();
                     state.push_execution_info(format!("Executing choice {}.", selected.choice));

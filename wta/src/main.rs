@@ -235,6 +235,18 @@ enum Command {
         delegate_agent: Option<String>,
     },
 
+    /// Attach to a running shared host (lightweight agent pane TUI)
+    #[command(name = "attach")]
+    Attach {
+        /// Override the host pipe name (auto-derived from WT pipe if omitted)
+        #[arg(long)]
+        host_pipe: Option<String>,
+
+        /// Initial prompt to submit on attach
+        #[arg(value_name = "PROMPT")]
+        prompt: Option<String>,
+    },
+
     /// Delegate a prompt to a new tab with a configured agent (fire-and-forget)
     Delegate {
         /// The prompt to send to the delegate agent
@@ -508,6 +520,20 @@ async fn main() -> Result<()> {
                 &pipe_override,
                 agent.unwrap_or_else(|| agent_registry::DEFAULT_ACP_COMMAND.to_string()),
                 delegate_agent,
+            )
+            .await
+        }
+
+        // ── Attach to shared host (lightweight pane TUI) ──
+        Some(Command::Attach { host_pipe, prompt }) => {
+            run_attach_tui(
+                pipe_override,
+                cli.agent,
+                cli.delegate_agent,
+                cli.delegate_model,
+                cli.no_autofix,
+                host_pipe,
+                prompt,
             )
             .await
         }
@@ -1134,14 +1160,9 @@ async fn run_ensure_host(
             };
             let shell_mgr = Arc::new(shell_mgr);
 
-            // Compute shared host pipe name.
-            let wt_info = po.pipe_name.as_ref().map(|name| {
-                shell::wt_channel::ConnectionInfo {
-                    pipe_name: name.clone(),
-                    token: po.pipe_token.clone().unwrap_or_default(),
-                    source: shell::wt_channel::DiscoverySource::EnvVar,
-                }
-            });
+            // Compute shared host pipe name.  Use resolve_pipe_info so the
+            // hash matches what attach clients compute (they also use it).
+            let wt_info = resolve_pipe_info(&po);
             let host_pipe_name = shared_host::pipe_name_for(
                 wt_info.as_ref(),
                 Some(agent_cmd.as_str()),
@@ -1228,6 +1249,213 @@ async fn run_ensure_host(
             Ok(())
         })
         .await
+}
+
+// ─── Attach TUI mode (lightweight pane client) ─────────────────────────────
+
+async fn run_attach_tui(
+    po: PipeOverride,
+    agent: String,
+    delegate_agent: Option<String>,
+    _delegate_model: Option<String>,
+    no_autofix: bool,
+    host_pipe_override: Option<String>,
+    initial_prompt: Option<String>,
+) -> Result<()> {
+    fn attach_log(msg: &str) {
+        use std::io::Write;
+        let path = std::env::temp_dir().join("wta-attach.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = writeln!(
+                f,
+                "[{:.3}] {}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs_f64(),
+                msg
+            );
+        }
+    }
+
+    attach_log("=== run_attach_tui started ===");
+
+    let (debug_tx, debug_rx) = tokio::sync::mpsc::unbounded_channel::<app::DebugMessage>();
+
+    // Connect to WT pipe (for pane identity discovery and event forwarding).
+    let mut shell_mgr = ShellManager::new();
+    let mut wt_event_rx = None;
+    let mut wt_pipe_channel: Option<Arc<PipeChannel>> = None;
+    let wt_connected = match connect_to_wt_pipe(&po, debug_tx.clone()).await {
+        Ok(channel) => {
+            attach_log("Connected to WT pipe OK");
+            wt_event_rx = Some(channel.subscribe_events());
+            let arc_channel = Arc::new(channel);
+            wt_pipe_channel = Some(Arc::clone(&arc_channel));
+            shell_mgr =
+                shell_mgr.with_wt_channel(arc_channel as Arc<dyn shell::wt_channel::WtChannel>);
+            true
+        }
+        Err(e) => {
+            attach_log(&format!("NO WT pipe: {}", e));
+            false
+        }
+    };
+    let shell_mgr = Arc::new(shell_mgr);
+
+    // Discover our own pane identity.
+    let pane_identity = if wt_connected {
+        discover_pane_identity(&shell_mgr).await
+    } else {
+        None
+    };
+    attach_log(&format!("pane_identity: {:?}", pane_identity));
+
+    // Compute the shared host pipe name (must match ensure-host).
+    let host_pipe_name = if let Some(name) = host_pipe_override {
+        name
+    } else {
+        let wt_info = resolve_pipe_info(&po);
+        shared_host::pipe_name_for(
+            wt_info.as_ref(),
+            Some(agent.as_str()),
+            delegate_agent.as_deref(),
+        )
+    };
+    attach_log(&format!("host_pipe_name: {}", host_pipe_name));
+
+    // Trigger _ensurePageEventsRegistered on the WT server.
+    if let Some(ref pipe_ch) = wt_pipe_channel {
+        pipe_ch.start_reader().await;
+        let _ = pipe_ch
+            .request("get_capabilities", serde_json::json!({}))
+            .await;
+    }
+
+    let autofix_enabled = !no_autofix;
+
+    // Set up the TUI.
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let local_set = tokio::task::LocalSet::new();
+    let result = local_set
+        .run_until(async {
+            let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (prompt_tx, prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (permission_tx, permission_rx) = tokio::sync::mpsc::unbounded_channel();
+            let debug_capture_enabled = Arc::new(AtomicBool::new(false));
+
+            // Crossterm event reader.
+            let evt_tx = event_tx.clone();
+            tokio::task::spawn_local(event::read_crossterm_events(evt_tx));
+
+            // Debug message forwarder.
+            let dbg_event_tx = event_tx.clone();
+            let mut debug_rx = debug_rx;
+            tokio::task::spawn_local(async move {
+                while let Some(msg) = debug_rx.recv().await {
+                    let _ = dbg_event_tx.send(app::AppEvent::DebugPipeMessage(msg));
+                }
+            });
+
+            // WT event reader (forwards push events to TUI).
+            if let Some(mut wt_rx) = wt_event_rx {
+                let wt_event_tx = event_tx.clone();
+                tokio::task::spawn_local(async move {
+                    while let Some(event_json) = wt_rx.recv().await {
+                        let method = event_json
+                            .get("method")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let pane_id = event_json
+                            .get("params")
+                            .and_then(|p| p.get("pane_id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let params = event_json
+                            .get("params")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+                        let _ = wt_event_tx.send(app::AppEvent::WtEvent {
+                            method,
+                            pane_id,
+                            params,
+                        });
+                    }
+                });
+            }
+
+            // Build PaneContext from discovered pane identity.
+            let pane_context = shared_host::PaneContext {
+                pane_id: pane_identity.as_ref().map(|(p, _, _)| p.clone()),
+                tab_id: pane_identity.as_ref().map(|(_, t, _)| t.clone()),
+                window_id: pane_identity.as_ref().map(|(_, _, w)| w.clone()),
+                cwd: std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty()),
+                source_pane_id: std::env::var("WTA_SOURCE_PANE_ID")
+                    .ok()
+                    .filter(|s| !s.is_empty()),
+            };
+
+            // Spawn the attach client (replaces run_acp_client in shared mode).
+            // In attach mode, all prompts/recommendations/permissions are forwarded
+            // to the shared host — no local ACP client or recommendation executor.
+            let attach_event_tx = event_tx.clone();
+            tokio::task::spawn_local(shared_host::run_attach_client(
+                host_pipe_name,
+                attach_event_tx,
+                prompt_rx,
+                recommendation_rx,
+                permission_rx,
+                pane_context,
+                initial_prompt,
+                debug_capture_enabled.clone(),
+            ));
+
+            let (_ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let mut app_state = app::App::new(
+                prompt_tx,
+                recommendation_tx,
+                permission_tx,
+                debug_capture_enabled,
+                wt_connected,
+                true, // shared_mode
+                autofix_enabled,
+            );
+            if let Some((pane_id, tab_id, window_id)) = pane_identity {
+                app_state.pane_id = Some(pane_id);
+                app_state.tab_id = Some(tab_id);
+                app_state.window_id = Some(window_id);
+            }
+            app_state.source_pane_id =
+                std::env::var("WTA_SOURCE_PANE_ID").ok().filter(|s| !s.is_empty());
+            app_state.source_cwd =
+                std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty());
+
+            app_state.run(&mut terminal, event_rx, ui_event_rx).await
+        })
+        .await;
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    if let Err(e) = result {
+        eprintln!("Error: {e:?}");
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 // ─── Default ACP TUI mode ───────────────────────────────────────────────────

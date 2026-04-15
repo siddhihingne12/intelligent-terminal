@@ -121,6 +121,9 @@ namespace Microsoft.Terminal.Protocol
         // Events — push-based via callback
         void Subscribe(IProtocolEventCallback callback);
         void Unsubscribe();
+
+        // Client-originated event publishing (agent → WT → listeners)
+        void SendEvent(String eventJson);
     }
 }
 

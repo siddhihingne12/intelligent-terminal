@@ -2961,12 +2961,44 @@ namespace winrt::TerminalApp::implementation
                             if (paneIdStr.empty())
                                 return;
 
+                            auto seqStr = winrt::to_string(seq);
+
+                            // Check for AgentEvent sub-action: "AgentEvent;{json}"
+                            static constexpr std::string_view agentPrefix = "AgentEvent;";
+                            if (seqStr.starts_with(agentPrefix))
+                            {
+                                auto jsonPayload = seqStr.substr(agentPrefix.size());
+                                Json::Value agentParams;
+                                Json::CharReaderBuilder rb;
+                                std::string errs;
+                                std::istringstream ss(jsonPayload);
+                                if (Json::parseFromStream(rb, ss, &agentParams, &errs) &&
+                                    agentParams.isObject() &&
+                                    agentParams.isMember("event") &&
+                                    agentParams["event"].isString())
+                                {
+                                    agentParams["pane_id"] = paneIdStr;
+
+                                    Json::Value evt;
+                                    evt["type"] = "event";
+                                    evt["method"] = "agent_event";
+                                    evt["params"] = agentParams;
+
+                                    Json::StreamWriterBuilder wb;
+                                    wb["indentation"] = "";
+                                    page->ProtocolVtSequenceReceived.raise(
+                                        *page,
+                                        winrt::to_hstring(Json::writeString(wb, evt)));
+                                    return; // Don't also emit as raw vt_sequence
+                                }
+                            }
+
                             Json::Value evt;
                             evt["type"] = "event";
                             evt["method"] = "vt_sequence";
                             Json::Value params;
                             params["pane_id"] = paneIdStr;
-                            params["sequence"] = winrt::to_string(seq);
+                            params["sequence"] = seqStr;
                             evt["params"] = params;
                             Json::StreamWriterBuilder wb;
                             wb["indentation"] = "";

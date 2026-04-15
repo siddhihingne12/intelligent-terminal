@@ -95,6 +95,9 @@ TerminalProtocolComServer : winrt::implements<TerminalProtocolComServer, Protoco
     void Subscribe(Protocol::IProtocolEventCallback const& callback);
     void Unsubscribe();
 
+    // Client-originated event publishing (agent → WT → listeners)
+    void SendEvent(winrt::hstring const& eventJson);
+
     // Static setup — must be called before s_StartListening().
     static void s_setEmperor(WindowEmperor* emperor) noexcept;
 

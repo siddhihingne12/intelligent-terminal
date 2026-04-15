@@ -177,26 +177,38 @@ void TerminalProtocolComServer::s_NotifyEventToComClients(const std::string& eve
 {
     const auto eventHstr = winrt::to_hstring(eventJson);
 
-    std::lock_guard lock{ s_instancesMutex };
-    for (auto* instance : s_instances)
+    // Snapshot callbacks under lock, then invoke outside the lock to avoid
+    // deadlocks if a callback reenters the server (e.g. via SendEvent).
+    std::vector<Protocol::IProtocolEventCallback> callbacks;
     {
-        Protocol::IProtocolEventCallback callback{ nullptr };
+        std::lock_guard lock{ s_instancesMutex };
+        for (auto* instance : s_instances)
         {
             std::lock_guard cbLock{ instance->_callbackMutex };
-            callback = instance->_callback;
+            if (instance->_callback)
+                callbacks.push_back(instance->_callback);
         }
-        if (!callback)
-            continue;
+    }
 
+    for (auto& callback : callbacks)
+    {
         try
         {
             callback.OnEvent(eventHstr);
         }
         catch (...)
         {
-            // Client disconnected — clear the callback.
-            std::lock_guard cbLock{ instance->_callbackMutex };
-            instance->_callback = nullptr;
+            // Client disconnected — find and clear the callback.
+            std::lock_guard lock{ s_instancesMutex };
+            for (auto* instance : s_instances)
+            {
+                std::lock_guard cbLock{ instance->_callbackMutex };
+                if (instance->_callback == callback)
+                {
+                    instance->_callback = nullptr;
+                    break;
+                }
+            }
         }
     }
 }
@@ -270,7 +282,7 @@ Protocol::AuthResult TerminalProtocolComServer::Authenticate(winrt::hstring cons
 
     Protocol::AuthResult result{};
     result.Authenticated = _authenticated;
-    result.ProtocolVersion = L"1.0";
+    result.ProtocolVersion = L"1.1";
     return result;
 }
 
@@ -296,6 +308,7 @@ winrt::hstring TerminalProtocolComServer::GetCapabilities()
         "quick_pick",
         "subscribe",
         "unsubscribe",
+        "send_event",
     };
 
     Json::Value methods(Json::arrayValue);
@@ -723,4 +736,24 @@ void TerminalProtocolComServer::Unsubscribe()
 {
     std::lock_guard lock{ _callbackMutex };
     _callback = nullptr;
+}
+
+void TerminalProtocolComServer::SendEvent(winrt::hstring const& eventJson)
+{
+    THROW_HR_IF(E_ACCESSDENIED, !_authenticated);
+
+    // Parse and validate the incoming JSON
+    auto jsonStr = winrt::to_string(eventJson);
+    Json::Value evt;
+    THROW_HR_IF(E_INVALIDARG, !_parseJson(jsonStr, evt));
+    THROW_HR_IF(E_INVALIDARG, !evt.isMember("params") || !evt["params"].isMember("event"));
+
+    // Normalize the envelope
+    evt["type"] = "event";
+    evt["method"] = "agent_event";
+
+    // Broadcast to all subscribed clients via the existing path
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    s_NotifyEventToComClients(Json::writeString(wb, evt));
 }

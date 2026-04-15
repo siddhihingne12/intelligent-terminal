@@ -684,10 +684,61 @@ int main()
         }
     });
 
+    // ── send-event ──
+    std::string sendEventType, sendEventJson, sendEventPaneTarget;
+    auto* sendEventCmd = app.add_subcommand("send-event", "Publish an event to all listeners")->alias("se");
+    sendEventCmd->add_option("-p,--pane", sendEventPaneTarget, "Source pane ID");
+    sendEventCmd->add_option("-e,--event", sendEventType, "Event type (e.g. agent.task.started)")->required();
+    sendEventCmd->add_option("json", sendEventJson, "Event params as JSON object");
+    sendEventCmd->callback([&]() {
+        auto server = connect();
+        if (!server)
+            return;
+        try
+        {
+            Json::Value evt;
+            evt["type"] = "event";
+            evt["method"] = "agent_event";
+
+            Json::Value params;
+            if (!sendEventJson.empty())
+            {
+                Json::CharReaderBuilder rb;
+                std::string errs;
+                std::istringstream ss(sendEventJson);
+                if (!Json::parseFromStream(rb, ss, &params, &errs) || !params.isObject())
+                {
+                    fprintf(stderr, "Invalid JSON: expected an object\n");
+                    exitCode = 1;
+                    return;
+                }
+            }
+
+            params["event"] = sendEventType;
+            if (!sendEventPaneTarget.empty())
+                params["pane_id"] = sendEventPaneTarget;
+            else
+                params["pane_id"] = std::to_string(ResolvePaneId(server, ""));
+
+            evt["params"] = params;
+
+            Json::StreamWriterBuilder wb;
+            wb["indentation"] = "";
+            server.SendEvent(winrt::to_hstring(Json::writeString(wb, evt)));
+        }
+        catch (const winrt::hresult_error& e)
+        {
+            fprintf(stderr, "SendEvent failed: 0x%08X\n", static_cast<uint32_t>(e.code()));
+            exitCode = 1;
+        }
+    });
+
     // ── listen ──
     std::string listenTarget;
+    std::string listenEventFilter;
     auto* listenCmd = app.add_subcommand("listen", "Stream real-time events from Windows Terminal");
     listenCmd->add_option("-t,--target", listenTarget, "Filter by pane ID");
+    listenCmd->add_option("--event", listenEventFilter, "Filter by event type (supports trailing wildcard, e.g. agent.*)");
     listenCmd->callback([&]() {
         auto server = ConnectToTerminal();
         if (!server) { exitCode = 1; return; }
@@ -705,8 +756,8 @@ int main()
         auto callback = winrt::make<EventCallback>([&](winrt::hstring const& eventJson) {
             auto eventUtf8 = winrt::to_string(eventJson);
 
-            // Optionally filter by pane_id
-            if (!listenTarget.empty())
+            // Optionally filter by pane_id and/or event type
+            if (!listenTarget.empty() || !listenEventFilter.empty())
             {
                 Json::Value ev;
                 Json::CharReaderBuilder rb;
@@ -714,9 +765,28 @@ int main()
                 std::istringstream ss(eventUtf8);
                 if (Json::parseFromStream(rb, ss, &ev, &errs))
                 {
-                    auto paneId = ev["params"].get("pane_id", "").asString();
-                    if (paneId != listenTarget)
-                        return;
+                    if (!listenTarget.empty())
+                    {
+                        auto paneId = ev["params"].get("pane_id", "").asString();
+                        if (paneId != listenTarget)
+                            return;
+                    }
+
+                    if (!listenEventFilter.empty())
+                    {
+                        auto eventType = ev["params"].get("event", "").asString();
+                        // Support trailing wildcard: "agent.*" matches "agent.task.started"
+                        if (listenEventFilter.back() == '*')
+                        {
+                            auto prefix = listenEventFilter.substr(0, listenEventFilter.size() - 1);
+                            if (eventType.substr(0, prefix.size()) != prefix)
+                                return;
+                        }
+                        else if (eventType != listenEventFilter)
+                        {
+                            return;
+                        }
+                    }
                 }
             }
 

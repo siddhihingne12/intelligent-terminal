@@ -71,15 +71,15 @@ pub const KNOWN_AGENTS: &[AgentProfile] = &[
     AgentProfile {
         id: "copilot",
         display_name: "GitHub Copilot",
-        exe_search_order: &[".exe"],
+        exe_search_order: &[".exe", ".cmd"],
         acp_flags: &["--acp", "--stdio"],
         acp_auth_flow: AcpAuthFlow::External,
         delegate_prompt_flag: PromptFlag::Flag("-i"),
         model_flags: &["--model", "-m"],
         install_hint: "npm install -g @github/copilot\n     or: winget install GitHub.Copilot",
         install_url: "https://github.com/github/copilot-cli",
-        auth_check_command: "copilot auth status",
-        auth_hint: "Run: copilot auth\n  or: gh auth login",
+        auth_check_command: "",
+        auth_hint: "Run 'copilot' to launch the CLI, then type /login to sign in.",
     },
     AgentProfile {
         id: "claude",

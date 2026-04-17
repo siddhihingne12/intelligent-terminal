@@ -150,20 +150,11 @@ pub fn render(frame: &mut Frame, app: &App, area: Rect) {
         HINT_STYLE,
     )));
 
-    // Checking state
-    if setup.checking {
-        lines.push(Line::from(Span::styled(
-            "  Rechecking...",
-            CHECK_STYLE,
-        )));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  [R] ", CHECK_STYLE),
-            Span::styled("Retry checks", HINT_STYLE),
-            Span::styled("   [Esc] ", CHECK_STYLE),
-            Span::styled("Close", HINT_STYLE),
-        ]));
-    }
+    // Tell the user to restart the terminal after fixing.
+    lines.push(Line::from(Span::styled(
+        "  After fixing, close and reopen Windows Terminal.",
+        HINT_STYLE,
+    )));
 
     let block = Block::default().borders(Borders::NONE);
     let paragraph = Paragraph::new(lines)

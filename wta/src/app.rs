@@ -109,8 +109,6 @@ pub struct SetupState {
     pub preflight: PreflightResult,
     /// Which check row is currently selected (0 = CLI, 1 = Auth).
     pub selected_index: usize,
-    /// True while a recheck is running.
-    pub checking: bool,
 }
 
 // --- WT Event Notification ---
@@ -535,7 +533,7 @@ impl App {
         Ok(())
     }
 
-    pub fn apply_resize_if_needed(
+    fn apply_resize_if_needed(
         &self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         event: &AppEvent,
@@ -552,7 +550,7 @@ impl App {
         Ok(())
     }
 
-    pub fn draw_frame(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    fn draw_frame(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         let total_started = std::time::Instant::now();
 
         let mut frame = terminal.get_frame();
@@ -652,7 +650,7 @@ impl App {
         )
     }
 
-    pub fn handle_event(&mut self, event: AppEvent) {
+    fn handle_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Tick => {
@@ -697,16 +695,72 @@ impl App {
                 self.prompt_name = Some(name);
             }
             AppEvent::AgentError(msg) => {
-                self.state = ConnectionState::Failed(msg.clone());
-                self.prompt_in_flight = false;
-                self.agent_streaming = false;
-                self.progress_status = None;
-                self.pending_thought_response.clear();
-                self.activity_frame = 0;
-                self.pending_agent_response.clear();
-                self.timing_note = None;
-                self.pending_completed_turn = None;
-                self.messages.push(ChatMessage::Error(msg));
+                // Check if this is an auth-related error — if so, show the
+                // Setup wizard with CLI ✓ and Auth ✗ instead of a raw error.
+                let lower = msg.to_ascii_lowercase();
+                let is_auth_error = lower.contains("auth")
+                    || lower.contains("login")
+                    || lower.contains("unauthorized")
+                    || lower.contains("401")
+                    || lower.contains("credentials");
+
+                if is_auth_error && self.mode != AppMode::Setup {
+                    // Extract agent id from the agent_name or fall back
+                    let agent_id = if self.agent_name.is_empty() {
+                        "copilot".to_string()
+                    } else {
+                        self.agent_name.to_ascii_lowercase()
+                    };
+                    let profile = crate::agent_registry::lookup_profile(&agent_id);
+
+                    // Build a preflight result with CLI passed, auth failed
+                    let auth_reason = msg
+                        .lines()
+                        .find(|l| {
+                            let ll = l.to_ascii_lowercase();
+                            ll.contains("auth") || ll.contains("login")
+                        })
+                        .unwrap_or("Not authenticated")
+                        .trim()
+                        .to_string();
+
+                    let preflight = PreflightResult {
+                        agent_id: profile.id.to_string(),
+                        display_name: profile.display_name.to_string(),
+                        cli_status: CheckStatus::Passed,
+                        cli_path: None,
+                        auth_status: CheckStatus::Failed(auth_reason),
+                        install_hint: profile.install_hint.to_string(),
+                        install_url: profile.install_url.to_string(),
+                        auth_hint: profile.auth_hint.to_string(),
+                    };
+
+                    self.mode = AppMode::Setup;
+                    self.setup = Some(SetupState {
+                        preflight,
+                        selected_index: 1, // select auth row
+                    });
+                    self.state = ConnectionState::Disconnected;
+                    self.prompt_in_flight = false;
+                    self.agent_streaming = false;
+                    self.progress_status = None;
+                    self.pending_thought_response.clear();
+                    self.activity_frame = 0;
+                    self.pending_agent_response.clear();
+                    self.timing_note = None;
+                    self.pending_completed_turn = None;
+                } else {
+                    self.state = ConnectionState::Failed(msg.clone());
+                    self.prompt_in_flight = false;
+                    self.agent_streaming = false;
+                    self.progress_status = None;
+                    self.pending_thought_response.clear();
+                    self.activity_frame = 0;
+                    self.pending_agent_response.clear();
+                    self.timing_note = None;
+                    self.pending_completed_turn = None;
+                    self.messages.push(ChatMessage::Error(msg));
+                }
             }
             AppEvent::ExecutionInfo(message) => {
                 self.push_execution_info(message);
@@ -920,7 +974,6 @@ impl App {
                     self.setup = Some(SetupState {
                         preflight: result,
                         selected_index: 0,
-                        checking: false,
                     });
                     self.state = ConnectionState::Disconnected;
                 }
@@ -928,7 +981,7 @@ impl App {
         }
     }
 
-    pub fn event_requires_redraw(&self, event: &AppEvent) -> bool {
+    fn event_requires_redraw(&self, event: &AppEvent) -> bool {
         match event {
             AppEvent::Tick => self.has_activity_indicator() || self.show_notification_banner,
             AppEvent::AgentMessageChunk(_) => true,
@@ -1155,6 +1208,19 @@ impl App {
             KeyCode::Esc => {
                 self.should_quit = true;
             }
+            KeyCode::Enter => {
+                // Open install URL based on selected row
+                if let Some(ref setup) = self.setup {
+                    if setup.selected_index == 0
+                        && setup.preflight.cli_status != CheckStatus::Passed
+                    {
+                        let url = setup.preflight.install_url.clone();
+                        if !url.is_empty() {
+                            let _ = open_url_in_browser(&url);
+                        }
+                    }
+                }
+            }
             KeyCode::Up => {
                 if let Some(ref mut setup) = self.setup {
                     if setup.selected_index > 0 {
@@ -1169,47 +1235,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                // Retry checks — set checking flag, actual recheck is driven
-                // by the main loop which watches this flag.
-                if let Some(ref mut setup) = self.setup {
-                    setup.checking = true;
-                }
-            }
-            KeyCode::Enter => {
-                // Open install URL or run auth based on selected row
-                if let Some(ref setup) = self.setup {
-                    if setup.selected_index == 0
-                        && setup.preflight.cli_status != CheckStatus::Passed
-                    {
-                        // Open install URL
-                        let url = setup.preflight.install_url.clone();
-                        if !url.is_empty() {
-                            let _ = open_url_in_browser(&url);
-                        }
-                    }
-                }
-            }
             _ => {}
         }
-    }
-
-    /// Returns true if the setup wizard wants to run a recheck.
-    pub fn setup_needs_recheck(&mut self) -> bool {
-        if let Some(ref mut setup) = self.setup {
-            if setup.checking {
-                setup.checking = false;
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Transition from Setup to Chat mode (called after preflight passes on retry).
-    pub fn transition_to_chat(&mut self) {
-        self.mode = AppMode::Chat;
-        self.setup = None;
-        self.state = ConnectionState::Connecting("Starting agent...".to_string());
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -1603,6 +1630,55 @@ impl App {
     }
 
     fn apply_shared_snapshot(&mut self, snapshot: SharedStateSnapshot) {
+        // Check if the snapshot contains an auth-related error — if so,
+        // switch to Setup wizard instead of showing a raw error.
+        if let ConnectionState::Failed(ref msg) = snapshot.state {
+            let lower = msg.to_ascii_lowercase();
+            let is_auth_error = lower.contains("auth")
+                || lower.contains("login")
+                || lower.contains("unauthorized")
+                || lower.contains("401")
+                || lower.contains("credentials");
+
+            if is_auth_error && self.mode != AppMode::Setup {
+                let agent_id = if snapshot.agent_name.is_empty() {
+                    "copilot".to_string()
+                } else {
+                    snapshot.agent_name.to_ascii_lowercase()
+                };
+                let profile = crate::agent_registry::lookup_profile(&agent_id);
+
+                let auth_reason = msg
+                    .lines()
+                    .find(|l| {
+                        let ll = l.to_ascii_lowercase();
+                        ll.contains("auth") || ll.contains("login")
+                    })
+                    .unwrap_or("Not authenticated")
+                    .trim()
+                    .to_string();
+
+                let preflight = PreflightResult {
+                    agent_id: profile.id.to_string(),
+                    display_name: profile.display_name.to_string(),
+                    cli_status: CheckStatus::Passed,
+                    cli_path: None,
+                    auth_status: CheckStatus::Failed(auth_reason),
+                    install_hint: profile.install_hint.to_string(),
+                    install_url: profile.install_url.to_string(),
+                    auth_hint: profile.auth_hint.to_string(),
+                };
+
+                self.mode = AppMode::Setup;
+                self.setup = Some(SetupState {
+                    preflight,
+                    selected_index: 1,
+                });
+                self.state = ConnectionState::Disconnected;
+                return;
+            }
+        }
+
         let recommendations_changed = self.recommendations != snapshot.recommendations;
         let completed_turns_changed = self.completed_turns != snapshot.completed_turns;
         let permission_changed = self

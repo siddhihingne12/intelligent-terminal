@@ -469,40 +469,18 @@ pub async fn run_host_server(
         delegate_agent_runtimes,
     ));
 
-    // Pre-flight: check if agent CLI is available before launching.
-    let preflight_result = crate::preflight::check_agent(&agent_cmd).await;
-    if preflight_result.all_passed() {
-        tokio::task::spawn_local(run_acp_client(
-            agent_cmd,
-            event_tx.clone(),
-            prompt_rx,
-            shell_mgr,
-            wt_connected,
-        ));
-    } else {
-        // Build a user-friendly error message from the preflight result.
-        let mut msg = format!("'{}' is not ready.\n", preflight_result.display_name);
-        if let crate::preflight::CheckStatus::Failed(reason) = &preflight_result.cli_status {
-            msg.push_str(&format!(
-                "\n  CLI: {} ({})\n",
-                reason, preflight_result.agent_id
-            ));
-            if !preflight_result.install_hint.is_empty() {
-                msg.push_str(&format!("  Install: {}\n", preflight_result.install_hint));
-            }
-            if !preflight_result.install_url.is_empty() {
-                msg.push_str(&format!("  Info: {}\n", preflight_result.install_url));
-            }
-        }
-        if let crate::preflight::CheckStatus::Failed(reason) = &preflight_result.auth_status {
-            msg.push_str(&format!("\n  Auth: {}\n", reason));
-            if !preflight_result.auth_hint.is_empty() {
-                msg.push_str(&format!("  {}\n", preflight_result.auth_hint));
-            }
-        }
-        msg.push_str("\nAfter fixing, restart the AI assistant to try again.");
-        let _ = event_tx.send(AppEvent::AgentError(msg));
-    }
+    // Launch ACP client directly. Pre-flight gating is done on the attach
+    // TUI side — the setup wizard prevents users from connecting to the
+    // shared host until the agent CLI is installed. If the CLI is missing
+    // here the spawn will fail and surface as an AgentError to any attached
+    // client.
+    tokio::task::spawn_local(run_acp_client(
+        agent_cmd,
+        event_tx.clone(),
+        prompt_rx,
+        shell_mgr,
+        wt_connected,
+    ));
 
     run_host_service(
         host_command_rx,

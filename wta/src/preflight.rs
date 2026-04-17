@@ -67,12 +67,15 @@ pub async fn check_agent(agent_cmd: &str) -> PreflightResult {
 
     // 1. Check if CLI is on PATH
     let resolved = agent_registry::resolve_bare_agent_name(agent_id);
+    preflight_log(&format!("check_agent: agent_id={} resolved={}", agent_id, resolved));
     match find_on_path(&resolved, profile) {
         Some(path) => {
+            preflight_log(&format!("check_agent: FOUND at {}", path));
             result.cli_status = CheckStatus::Passed;
             result.cli_path = Some(path);
         }
         None => {
+            preflight_log("check_agent: NOT FOUND");
             result.cli_status = CheckStatus::Failed("Not found on PATH".to_string());
             // Skip auth check if CLI isn't even installed
             result.auth_status = CheckStatus::Skipped;
@@ -95,9 +98,33 @@ pub async fn check_agent(agent_cmd: &str) -> PreflightResult {
     result
 }
 
+fn preflight_log(msg: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("wta-preflight.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(
+            f,
+            "[{:.3}] {}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+            msg
+        );
+    }
+}
+
 /// Find the agent executable on PATH and return its full path.
+/// Re-reads PATH from the Windows registry so that newly installed programs
+/// are found even if this process was started before the install.
 fn find_on_path(resolved_name: &str, profile: &AgentProfile) -> Option<String> {
-    let path_var = std::env::var("PATH").ok()?;
+    let path_var = fresh_path();
+    preflight_log(&format!("find_on_path: resolved_name={} path_len={}", resolved_name, path_var.len()));
+    preflight_log(&format!("find_on_path: PATH={}", &path_var));
 
     // Try the resolved name first (e.g. "copilot.exe")
     for dir in std::env::split_paths(&path_var) {
@@ -174,4 +201,114 @@ async fn check_auth(auth_check_command: &str) -> CheckStatus {
             CheckStatus::Failed("Could not run auth check".to_string())
         }
     }
+}
+
+/// Read the current PATH by combining the system and user PATH values from the
+/// Windows registry.  This picks up programs installed after this process started.
+/// Falls back to the process's inherited PATH if registry reads fail.
+fn fresh_path() -> String {
+    use std::os::windows::ffi::OsStringExt;
+
+    fn read_reg_path(hkey: windows_sys::Win32::System::Registry::HKEY, subkey: &str) -> Option<String> {
+        use windows_sys::Win32::System::Registry::*;
+
+        let subkey_wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        let value_name: Vec<u16> = "Path".encode_utf16().chain(std::iter::once(0)).collect();
+
+        let mut hk: HKEY = std::ptr::null_mut();
+        let ret = unsafe {
+            RegOpenKeyExW(
+                hkey,
+                subkey_wide.as_ptr(),
+                0,
+                KEY_READ,
+                &mut hk,
+            )
+        };
+        if ret != 0 {
+            return None;
+        }
+
+        let mut buf_size: u32 = 8192;
+        let mut buffer: Vec<u16> = vec![0u16; buf_size as usize / 2];
+        let mut kind: u32 = 0;
+        let ret = unsafe {
+            RegQueryValueExW(
+                hk,
+                value_name.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                buffer.as_mut_ptr() as *mut u8,
+                &mut buf_size,
+            )
+        };
+        unsafe { RegCloseKey(hk) };
+        if ret != 0 {
+            return None;
+        }
+
+        let len = (buf_size as usize / 2).saturating_sub(1); // strip null terminator
+        let raw = std::ffi::OsString::from_wide(&buffer[..len]);
+        let raw_str = raw.to_string_lossy().to_string();
+
+        // Expand environment variables like %USERPROFILE%, %APPDATA%, etc.
+        // PATH is typically stored as REG_EXPAND_SZ.
+        if kind == REG_EXPAND_SZ {
+            expand_env_vars(&raw_str)
+        } else {
+            Some(raw_str)
+        }
+    }
+
+    let system_path = read_reg_path(
+        windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE,
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+    );
+    let user_path = read_reg_path(
+        windows_sys::Win32::System::Registry::HKEY_CURRENT_USER,
+        r"Environment",
+    );
+
+    match (system_path, user_path) {
+        (Some(s), Some(u)) => format!("{};{}", s, u),
+        (Some(s), None) => s,
+        (None, Some(u)) => u,
+        (None, None) => std::env::var("PATH").unwrap_or_default(),
+    }
+}
+
+/// Expand environment variable references (%VAR%) in a string using
+/// the Win32 ExpandEnvironmentStringsW API.
+fn expand_env_vars(s: &str) -> Option<String> {
+    use std::os::windows::ffi::OsStringExt;
+
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+
+    // First call to get required buffer size
+    let needed = unsafe {
+        windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed == 0 {
+        return Some(s.to_string());
+    }
+
+    let mut out: Vec<u16> = vec![0u16; needed as usize];
+    let written = unsafe {
+        windows_sys::Win32::System::Environment::ExpandEnvironmentStringsW(
+            wide.as_ptr(),
+            out.as_mut_ptr(),
+            needed,
+        )
+    };
+    if written == 0 {
+        return Some(s.to_string());
+    }
+
+    let len = (written as usize).saturating_sub(1); // strip null terminator
+    let os_str = std::ffi::OsString::from_wide(&out[..len]);
+    Some(os_str.to_string_lossy().to_string())
 }

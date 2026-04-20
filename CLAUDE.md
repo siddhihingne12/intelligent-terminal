@@ -82,6 +82,28 @@ Detects command failures in other panes and auto-suggests fixes via the agent.
 
 **Diag log**: `%TEMP%\wta-event-diag.log` — shows event flow, classification, and autofix triggers.
 
+## Logs
+
+WTA writes structured logs to the package-sandboxed LOCALAPPDATA:
+
+```
+%LOCALAPPDATA%\AgenticTerminal\logs\
+  wta-ensure-host.log   — background host startup / COM connection
+  wta-attach.log        — agent pane TUI (attach mode)
+  wta-agent-pane.log    — agent pane session
+  wta-acp-debug.log     — ACP protocol debug trace
+  wta-delegate.log      — ?<prompt> delegation flow
+```
+
+When running packaged (F5 / installed), `%LOCALAPPDATA%` is redirected to the
+package sandbox:
+```
+C:\Users\<user>\AppData\Local\Packages\AgenticTerminal_<id>\LocalCache\Local\AgenticTerminal\logs\
+```
+
+Log level is controlled by the `WTA_LOG` env var (default: `info`). Set
+`WTA_LOG=debug` for verbose output.
+
 ## Build
 
 There are two independent build systems. **Both must be built** before F5.

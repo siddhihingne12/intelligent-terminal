@@ -5,7 +5,7 @@ use anyhow::Result;
 use std::pin::Pin;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc, Mutex, OnceLock,
+    Arc, Mutex,
 };
 use std::task::{Context, Poll};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, BufReader, ReadBuf};
@@ -926,27 +926,8 @@ async fn build_prompt_text(
     )
 }
 
-/// Write a line to wta-acp-debug.log.
-fn acp_log_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| true)
-}
-
 fn acp_log(msg: &str) {
-    if !acp_log_enabled() {
-        return;
-    }
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(crate::runtime_paths::runtime_log_path("wta-acp-debug.log"))
-    {
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let _ = writeln!(f, "[{:.3}] {}", elapsed.as_secs_f64(), msg);
-    }
+    tracing::debug!(target: "acp", "{}", msg);
 }
 
 fn acp_log_built_prompt(
@@ -955,18 +936,15 @@ fn acp_log_built_prompt(
     prompt_source: &str,
     prompt_text: &str,
 ) {
-    if !acp_log_enabled() {
-        return;
-    }
-
-    acp_log(&format!(
-        "planner_prompt_begin user_text_len={} pane_context={} prompt_source={}",
-        user_text.len(),
-        format_pane_context_summary(pane_context),
-        prompt_source
-    ));
-    acp_log(&format!("planner_prompt_text:\n{}", prompt_text));
-    acp_log("planner_prompt_end");
+    tracing::debug!(
+        target: "acp",
+        user_text_len = user_text.len(),
+        pane_context = %format_pane_context_summary(pane_context),
+        prompt_source,
+        "planner_prompt_begin"
+    );
+    tracing::debug!(target: "acp", "planner_prompt_text:\n{}", prompt_text);
+    tracing::debug!(target: "acp", "planner_prompt_end");
 }
 
 #[derive(Clone)]
@@ -982,13 +960,7 @@ impl StartupProbe {
     }
 
     fn log(&self, msg: &str) {
-        if acp_log_enabled() {
-            acp_log(&format!(
-                "{} (t+{:.3}s)",
-                msg,
-                self.begin.elapsed().as_secs_f64()
-            ));
-        }
+        acp_log(&format!("{} (t+{:.3}s)", msg, self.begin.elapsed().as_secs_f64()));
     }
 }
 
@@ -1113,12 +1085,7 @@ impl acp::Client for WtaClient {
         &self,
         args: acp::RequestPermissionRequest,
     ) -> acp::Result<acp::RequestPermissionResponse> {
-        if acp_log_enabled() {
-            acp_log(&format!(
-                "request_permission: {:?}",
-                args.tool_call.fields.title
-            ));
-        }
+        acp_log(&format!("request_permission: {:?}", args.tool_call.fields.title));
         let description = args
             .tool_call
             .fields
@@ -1165,9 +1132,7 @@ impl acp::Client for WtaClient {
     }
 
     async fn session_notification(&self, args: acp::SessionNotification) -> acp::Result<()> {
-        if acp_log_enabled() {
-            acp_log(&format!("session_notification: {:?}", args.update));
-        }
+        acp_log(&format!("session_notification: {:?}", args.update));
         self.state
             .prompt_timing
             .observe_session_update(session_update_kind(&args.update));
@@ -1233,12 +1198,7 @@ impl acp::Client for WtaClient {
         &self,
         args: acp::CreateTerminalRequest,
     ) -> acp::Result<acp::CreateTerminalResponse> {
-        if acp_log_enabled() {
-            acp_log(&format!(
-                "create_terminal called: cmd={} args={:?}",
-                args.command, args.args
-            ));
-        }
+        acp_log(&format!("create_terminal called: cmd={} args={:?}", args.command, args.args));
         let env: Vec<(String, String)> = args
             .env
             .iter()
@@ -1341,6 +1301,7 @@ pub async fn run_acp_client(
     mut prompt_rx: mpsc::UnboundedReceiver<PromptSubmission>,
     shell_mgr: Arc<ShellManager>,
     wt_connected: bool,
+    initial_cwd: Option<String>,
 ) {
     let startup_probe = StartupProbe::new();
     startup_probe.log(&format!(
@@ -1354,6 +1315,7 @@ pub async fn run_acp_client(
         &mut prompt_rx,
         shell_mgr,
         wt_connected,
+        initial_cwd,
     )
     .await
     {
@@ -1370,6 +1332,7 @@ async fn run_inner(
     prompt_rx: &mut mpsc::UnboundedReceiver<PromptSubmission>,
     shell_mgr: Arc<ShellManager>,
     wt_connected: bool,
+    initial_cwd: Option<String>,
 ) -> Result<()> {
     let startup_probe = StartupProbe::new();
 
@@ -1507,7 +1470,11 @@ async fn run_inner(
     // Create session — also with a timeout.
     let _ = event_tx.send(AppEvent::ConnectionStage("Creating session...".to_string()));
     startup_probe.log("Creating session");
-    let cwd = std::env::current_dir().unwrap_or_default();
+    let cwd = initial_cwd
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
     startup_probe.log(&format!("Using session cwd={}", cwd.display()));
     let session_future = conn.new_session(acp::NewSessionRequest::new(cwd));
     let session = tokio::time::timeout(std::time::Duration::from_secs(15), session_future)

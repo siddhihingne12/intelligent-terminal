@@ -246,7 +246,10 @@ async fn execute_choice(
                     action_label, parent
                 )));
                 let payload = if insert_only {
-                    input.clone()
+                    // TerminalPage::SendProtocolInput replaces \n with \r (Enter).
+                    // Trim trailing newlines so insert-only mode doesn't accidentally
+                    // execute the command in the target pane.
+                    input.trim_end_matches(['\r', '\n']).to_string()
                 } else {
                     format!("{input}\r")
                 };
@@ -769,18 +772,7 @@ fn truncate_for_log(text: &str, max_chars: usize) -> String {
 }
 
 fn coordinator_log(msg: &str) {
-    use std::io::Write;
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(crate::runtime_paths::runtime_log_path("wta-acp-debug.log"))
-    {
-        let elapsed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        let _ = writeln!(file, "[{:.3}] {}", elapsed.as_secs_f64(), msg);
-    }
+    tracing::debug!(target: "coordinator", "{}", msg);
 }
 
 fn extract_json_code_block(text: &str) -> Option<&str> {

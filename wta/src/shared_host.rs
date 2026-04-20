@@ -588,12 +588,14 @@ pub async fn run_host_server(
         delegate_agent_runtimes,
     ));
 
+    let initial_cwd = std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty());
     tokio::task::spawn_local(run_acp_client(
         agent_cmd,
         event_tx.clone(),
         prompt_rx,
         shell_mgr,
         wt_connected,
+        initial_cwd,
     ));
 
     run_host_service(
@@ -1373,24 +1375,7 @@ fn broadcast_event(clients: &mut HashMap<u64, AttachedClient>, event: &SharedUiE
 }
 
 fn host_log(message: &str) {
-    use std::io::Write;
-
-    if std::env::var("WTA_DEBUG_LOG").as_deref() != Ok("1") {
-        return;
-    }
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(crate::runtime_paths::runtime_log_path("wta-host-debug.log"))
-    {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        let _ = writeln!(file, "[{:.3}] {}", timestamp, message);
-        let _ = file.flush();
-    }
+    tracing::debug!(target: "host", "{}", message);
 }
 
 fn host_server_message_name(message: &HostServerMessage) -> &'static str {

@@ -816,10 +816,7 @@ impl App {
                 pane_id,
                 params,
             } => {
-                autofix_log(&format!(
-                    "WtEvent: method={} pane_id={} self.pane_id={:?}",
-                    method, pane_id, self.pane_id
-                ));
+                tracing::debug!(target: "autofix", method = %method, pane_id = %pane_id, self_pane_id = ?self.pane_id, "WtEvent");
 
                 // autofix_execute is an inbound UI action ("run the armed
                 // fix now") from TerminalPage. pane_id is the failing
@@ -833,15 +830,12 @@ impl App {
 
                 // Skip events from our own pane
                 if self.pane_id.as_deref() == Some(pane_id.as_str()) {
-                    autofix_log("skipped: own pane");
+                    tracing::debug!(target: "autofix", "skipped: own pane");
                     return;
                 }
 
                 let notification = classify_wt_event(&method, &pane_id, &params);
-                autofix_log(&format!(
-                    "classified: severity={:?} summary={}",
-                    notification.severity, notification.summary
-                ));
+                tracing::debug!(target: "autofix", severity = ?notification.severity, summary = %notification.summary, "classified");
 
                 // Always log to chat for critical/actionable events
                 match notification.severity {
@@ -854,7 +848,7 @@ impl App {
                     WtEventSeverity::Actionable => {
                         if method == "agent_prompt" {
                             if self.shared_mode {
-                                autofix_log("shared_mode: ignoring agent_prompt event (host handles delegation)");
+                                tracing::debug!(target: "autofix", "shared_mode: ignoring agent_prompt event (host handles delegation)");
                                 return;
                             }
                             // Command palette prompt: delegate directly to a new tab agent.
@@ -864,7 +858,7 @@ impl App {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            autofix_log(&format!("agent_prompt: delegating, prompt_len={}", prompt.len()));
+                            tracing::info!(target: "autofix", prompt_len = prompt.len(), "agent_prompt: delegating");
                             if !prompt.is_empty() {
                                 self.delegate_to_tab_agent(&prompt, None);
                             }
@@ -1026,14 +1020,7 @@ impl App {
                 self.collapse_selected_history_turn();
             }
             KeyCode::Enter => {
-                autofix_log(&format!(
-                    "Enter: input_empty={} state={:?} recs={} autofix_pane={:?} selected_idx={}",
-                    self.input.is_empty(),
-                    self.state,
-                    self.recommendations.is_some(),
-                    self.autofix_pane_id,
-                    self.selected_recommendation,
-                ));
+                tracing::debug!(target: "autofix", input_empty = self.input.is_empty(), state = ?self.state, has_recs = self.recommendations.is_some(), autofix_pane = ?self.autofix_pane_id, selected_idx = self.selected_recommendation, "Enter");
                 if self.input.is_empty()
                     && self.state == ConnectionState::Connected
                     && self.recommendations.is_some()
@@ -1041,7 +1028,7 @@ impl App {
                     if let Some(mut choice) = self.selected_recommendation().cloned() {
                         let insert_only = self.selected_button == 0
                             && self.is_send_choice(&choice);
-                        autofix_log(&format!("Executing choice {} actions={} insert_only={}", choice.choice, choice.actions.len(), insert_only));
+                        tracing::info!(target: "autofix", choice = choice.choice, actions = choice.actions.len(), insert_only, "Executing choice");
                         // Auto-fill parent for Send actions from auto-fix.
                         if let Some(ref pane_id) = self.autofix_pane_id {
                             for action in &mut choice.actions {
@@ -1290,7 +1277,7 @@ impl App {
     /// This is the same path used by the command palette — single code path for
     /// context capture, prompt building, and tab creation.
     pub fn delegate_to_tab_agent(&self, prompt: &str, source_pane_id: Option<&str>) {
-        autofix_log(&format!("delegate_to_tab_agent called, prompt_len={}, shared_mode={}", prompt.len(), self.shared_mode));
+        tracing::info!(target: "autofix", prompt_len = prompt.len(), shared_mode = self.shared_mode, "delegate_to_tab_agent called");
         let exe = match std::env::current_exe() {
             Ok(p) => p,
             Err(_) => return,
@@ -1367,7 +1354,7 @@ impl App {
         let prompt = PromptSubmission::new_autofix(prompt_text, Some(pane_context));
         self.current_prompt_id = Some(prompt.id);
         self.current_prompt_submitted_at_unix_s = Some(prompt.submitted_at_unix_s);
-        autofix_log(&format!("sending auto-fix prompt for pane {}", notification.pane_id));
+        tracing::info!(target: "autofix", pane_id = %notification.pane_id, "sending auto-fix prompt");
         let _ = self.prompt_tx.send(prompt);
 
         // Light up the bottom-bar diagnostic icon in "Pending" state — the
@@ -1413,19 +1400,14 @@ impl App {
     /// window). Mirrors the Enter-key path in the recommendations handler
     /// but without requiring the agent pane to be focused.
     fn handle_autofix_execute_request(&mut self, requested_pane_id: &str) {
-        autofix_log(&format!(
-            "autofix_execute received: requested_pane={} armed_pane={:?} has_recs={}",
-            requested_pane_id,
-            self.autofix_pane_id,
-            self.recommendations.is_some()
-        ));
+        tracing::info!(target: "autofix", requested_pane = %requested_pane_id, armed_pane = ?self.autofix_pane_id, has_recs = self.recommendations.is_some(), "autofix_execute received");
         // Only execute if we have a cached autofix for the requested pane.
         // The pane_id check prevents a stale UI click from running against
         // an unrelated, more recent error.
         let armed_pane = match self.autofix_pane_id.clone() {
             Some(p) if p == requested_pane_id => p,
             _ => {
-                autofix_log("autofix_execute: no armed fix for this pane");
+                tracing::info!(target: "autofix", "autofix_execute: no armed fix for this pane");
                 // Tell the UI anyway so it returns to Idle.
                 self.emit_autofix_state_cleared(requested_pane_id);
                 return;
@@ -1729,10 +1711,7 @@ impl App {
                 if let Some(pane_id) = self.autofix_pane_id.clone() {
                     if let Some(rec) = self.recommendations.as_ref() {
                         let preview = Self::armed_fix_preview(rec);
-                        autofix_log(&format!(
-                            "apply_shared_snapshot: recs ready, emitting armed for pane {}",
-                            pane_id
-                        ));
+                        tracing::info!(target: "autofix", pane_id = %pane_id, "apply_shared_snapshot: recs ready, emitting armed");
                         self.emit_autofix_state_armed(&pane_id, &preview);
                     }
                 }
@@ -1740,10 +1719,7 @@ impl App {
                 // Recommendations were cleared (agent retry / dismissal) —
                 // bring the bottom bar back to Idle so it doesn't stay armed.
                 let pane_id = self.autofix_pane_id.clone().unwrap();
-                autofix_log(&format!(
-                    "apply_shared_snapshot: recs cleared, emitting cleared for pane {}",
-                    pane_id
-                ));
+                tracing::info!(target: "autofix", pane_id = %pane_id, "apply_shared_snapshot: recs cleared, emitting cleared");
                 self.emit_autofix_state_cleared(&pane_id);
             }
         }
@@ -1867,9 +1843,7 @@ pub fn armed_fix_preview(rec: &crate::coordinator::RecommendationSet) -> String 
 /// leaving the bottom-bar stuck in the earlier state.
 pub fn send_wt_protocol_event(json_payload: String) {
     let tx = publisher_sender();
-    if let Err(err) = tx.send(json_payload) {
-        crate::log_event_diag!(Warn, "publish queue send failed: {err}");
-    }
+    let _ = tx.send(json_payload);
 }
 
 fn publisher_sender() -> &'static std::sync::mpsc::Sender<String> {
@@ -1909,15 +1883,9 @@ fn publish_event_blocking(json_payload: &str) {
         Ok(mut child) => {
             // Block the publisher thread until this publish finishes so
             // the next event's subprocess can't overtake it.
-            let wait_result = child.wait();
-            crate::log_event_diag!(
-                Debug,
-                "published event: {} (wait={:?})",
-                truncate(json_payload, 200),
-                wait_result.as_ref().map(|s| s.code()).ok()
-            );
+            let _ = child.wait();
         }
-        Err(err) => crate::log_event_diag!(Warn, "publish failed to spawn: {err}"),
+        Err(_) => {},
     }
 }
 
@@ -1925,25 +1893,6 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}…", &s[..max]) }
 }
 
-fn autofix_log(msg: &str) {
-    use std::io::Write;
-    let path = std::env::temp_dir().join("wta-event-diag.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(
-            f,
-            "[{:.3}] autofix: {}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64(),
-            msg
-        );
-    }
-}
 
 fn now_unix_s() -> f64 {
     std::time::SystemTime::now()

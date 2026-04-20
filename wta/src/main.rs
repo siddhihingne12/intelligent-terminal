@@ -2,6 +2,7 @@ mod agent_registry;
 mod app;
 mod coordinator;
 mod event;
+mod logging;
 mod protocol;
 mod runtime_paths;
 mod shared_host;
@@ -1006,28 +1007,20 @@ async fn run_delegate(
     cwd: Option<&str>,
     source_pane: Option<&str>,
 ) -> Result<()> {
-    fn dlog(msg: &str) {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("wta-delegate.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "[{:.3}] {}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
-        }
-    }
-    dlog(&format!("run_delegate: prompt={:?} agent={} cwd={:?} source_pane={:?}",
-        prompt, agent_cmd, cwd, source_pane));
+    let _guard = logging::init("delegate");
+    tracing::info!(prompt, agent = agent_cmd, cwd, source_pane, "run_delegate started");
 
     let (debug_tx, _) = tokio::sync::mpsc::unbounded_channel::<app::DebugMessage>();
     let channel = match connect_to_wt_pipe(po, debug_tx).await {
-        Ok(ch) => { dlog("pipe connected"); ch }
-        Err(e) => { dlog(&format!("pipe FAILED: {:#}", e)); return Err(e); }
+        Ok(ch) => { tracing::info!("pipe connected"); ch }
+        Err(e) => { tracing::warn!(error = %e, "pipe FAILED"); return Err(e); }
     };
     let shell_mgr = ShellManager::new()
         .with_wt_channel(Arc::new(channel) as Arc<dyn shell::wt_channel::WtChannel>);
 
     match delegate_with_context(&shell_mgr, prompt, agent_cmd, delegate_agent_cmd, delegate_model, source_pane, cwd).await {
-        Ok(()) => { dlog("delegate OK"); Ok(()) }
-        Err(e) => { dlog(&format!("delegate FAILED: {:#}", e)); Err(e) }
+        Ok(()) => { tracing::info!("delegate OK"); Ok(()) }
+        Err(e) => { tracing::warn!(error = %e, "delegate FAILED"); Err(e) }
     }
 }
 
@@ -1080,18 +1073,7 @@ async fn delegate_with_context(
 
     let commandline = crate::coordinator::build_delegate_commandline(runtime, &full_prompt)?;
 
-    // Log the final commandline for diagnostics.
-    {
-        fn dlog(msg: &str) {
-            use std::io::Write;
-            let path = std::env::temp_dir().join("wta-delegate.log");
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = writeln!(f, "[{:.3}] {}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
-            }
-        }
-        dlog(&format!("delegate_with_context: commandline={:?} cwd={:?}", commandline, cwd));
-    }
+    tracing::debug!(commandline, cwd, "delegate_with_context: launching");
 
     // Launch the delegate agent directly as the tab process.
     shell_mgr
@@ -1109,27 +1091,8 @@ async fn run_ensure_host(
     delegate_agent_cmd: Option<String>,
     delegate_model: Option<String>,
 ) -> Result<()> {
-    fn host_log(msg: &str) {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("wta-ensure-host.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(
-                f,
-                "[{:.3}] {}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64(),
-                msg
-            );
-        }
-    }
-
-    host_log("=== ensure-host starting ===");
+    let _guard = logging::init("ensure-host");
+    tracing::info!("=== ensure-host starting ===");
 
     let local_set = tokio::task::LocalSet::new();
     local_set
@@ -1141,27 +1104,27 @@ async fn run_ensure_host(
             let mut shell_mgr = ShellManager::new();
             let wt_event_rx = match connect_to_wt_pipe(po, debug_tx).await {
                 Ok(channel) => {
-                    host_log("Connected to WT pipe");
+                    tracing::info!("Connected to WT pipe");
                     let event_rx = channel.subscribe_events();
                     let arc_channel = Arc::new(channel);
                     shell_mgr = shell_mgr.with_wt_channel(
                         arc_channel.clone() as Arc<dyn shell::wt_channel::WtChannel>,
                     );
 
-                    host_log("Starting pipe reader...");
+                    tracing::info!("Starting pipe reader...");
                     arc_channel.start_reader().await;
-                    host_log("Pipe reader started, fetching capabilities...");
+                    tracing::info!("Pipe reader started, fetching capabilities...");
                     match arc_channel
                         .request("get_capabilities", serde_json::json!({}))
                         .await
                     {
-                        Ok(v) => host_log(&format!("get_capabilities OK: {}", v)),
-                        Err(e) => host_log(&format!("get_capabilities FAILED: {}", e)),
+                        Ok(v) => tracing::info!(result = %v, "get_capabilities OK"),
+                        Err(e) => tracing::warn!(error = %e, "get_capabilities FAILED"),
                     }
                     Some(event_rx)
                 }
                 Err(e) => {
-                    host_log(&format!("No WT pipe: {}", e));
+                    tracing::warn!(error = %e, "No WT pipe");
                     None
                 }
             };
@@ -1175,7 +1138,7 @@ async fn run_ensure_host(
                 Some(agent_cmd.as_str()),
                 delegate_agent_cmd.as_deref(),
             );
-            host_log(&format!("Host pipe: {}", host_pipe_name));
+            tracing::info!(pipe = %host_pipe_name, "Host pipe");
 
             // Autofix command channel. The host-side WT event listener pushes
             // Trigger on actionable failures and Execute when the user clicks
@@ -1237,7 +1200,7 @@ async fn run_ensure_host(
                                 .unwrap_or("")
                                 .to_string();
                             if !prompt.is_empty() {
-                                host_log(&format!("agent_prompt received: {}", prompt));
+                                tracing::info!(prompt = %prompt, "agent_prompt received");
                                 let choice = crate::coordinator::RecommendationChoice {
                                     choice: 1,
                                     title: "Delegate to tab agent".into(),
@@ -1264,10 +1227,7 @@ async fn run_ensure_host(
                         // User pressed Ctrl+. or clicked the bottom-bar
                         // autofix icon — execute the armed recommendation.
                         if method == "autofix_execute" {
-                            host_log(&format!(
-                                "host autofix_execute: pane={}",
-                                pane_id
-                            ));
+                            tracing::info!(pane_id = %pane_id, "host autofix_execute");
                             let _ = host_autofix_tx.send(
                                 shared_host::HostAutofixCommand::Execute {
                                     pane_id: pane_id.clone(),
@@ -1285,10 +1245,7 @@ async fn run_ensure_host(
                         if note.severity == crate::app::WtEventSeverity::Actionable
                             && method != "agent_prompt"
                         {
-                            host_log(&format!(
-                                "host autofix trigger: pane={} summary={}",
-                                pane_id, note.summary
-                            ));
+                            tracing::info!(pane_id = %pane_id, summary = %note.summary, "host autofix trigger");
                             let _ = host_autofix_tx.send(
                                 shared_host::HostAutofixCommand::Trigger {
                                     pane_id: pane_id.clone(),
@@ -1304,7 +1261,7 @@ async fn run_ensure_host(
             }
 
             // Start the shared host server (ACP client + host service).
-            host_log("Starting shared host server...");
+            tracing::info!("Starting shared host server...");
             match shared_host::run_host_server(
                 host_pipe_name,
                 agent_cmd,
@@ -1315,8 +1272,8 @@ async fn run_ensure_host(
             )
             .await
             {
-                Ok(()) => host_log("Shared host server exited normally"),
-                Err(e) => host_log(&format!("Shared host server FAILED: {:#}", e)),
+                Ok(()) => tracing::info!("Shared host server exited normally"),
+                Err(e) => tracing::warn!(error = %e, "Shared host server FAILED"),
             }
             Ok(())
         })
@@ -1334,27 +1291,8 @@ async fn run_attach_tui(
     host_pipe_override: Option<String>,
     initial_prompt: Option<String>,
 ) -> Result<()> {
-    fn attach_log(msg: &str) {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("wta-attach.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(
-                f,
-                "[{:.3}] {}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs_f64(),
-                msg
-            );
-        }
-    }
-
-    attach_log("=== run_attach_tui started ===");
+    let _guard = logging::init("attach");
+    tracing::info!("=== run_attach_tui started ===");
 
     let (debug_tx, debug_rx) = tokio::sync::mpsc::unbounded_channel::<app::DebugMessage>();
 
@@ -1364,7 +1302,7 @@ async fn run_attach_tui(
     let mut wt_pipe_channel: Option<Arc<PipeChannel>> = None;
     let wt_connected = match connect_to_wt_pipe(&po, debug_tx.clone()).await {
         Ok(channel) => {
-            attach_log("Connected to WT pipe OK");
+            tracing::info!("Connected to WT pipe OK");
             wt_event_rx = Some(channel.subscribe_events());
             let arc_channel = Arc::new(channel);
             wt_pipe_channel = Some(Arc::clone(&arc_channel));
@@ -1373,7 +1311,7 @@ async fn run_attach_tui(
             true
         }
         Err(e) => {
-            attach_log(&format!("NO WT pipe: {}", e));
+            tracing::warn!(error = %e, "NO WT pipe");
             false
         }
     };
@@ -1385,7 +1323,7 @@ async fn run_attach_tui(
     } else {
         None
     };
-    attach_log(&format!("pane_identity: {:?}", pane_identity));
+    tracing::info!(pane_identity = ?pane_identity, "pane_identity");
 
     // Compute the shared host pipe name (must match ensure-host).
     let host_pipe_name = if let Some(name) = host_pipe_override {
@@ -1398,7 +1336,7 @@ async fn run_attach_tui(
             delegate_agent.as_deref(),
         )
     };
-    attach_log(&format!("host_pipe_name: {}", host_pipe_name));
+    tracing::info!(host_pipe_name = %host_pipe_name, "host_pipe_name");
 
     // Trigger _ensurePageEventsRegistered on the WT server.
     if let Some(ref pipe_ch) = wt_pipe_channel {
@@ -1533,16 +1471,8 @@ async fn run_attach_tui(
 // ─── Default ACP TUI mode ───────────────────────────────────────────────────
 
 async fn run_default_tui(cli: Cli, po: PipeOverride) -> Result<()> {
-    // Early diagnostic log — written to a fixed path so we can always find it.
-    fn early_log(msg: &str) {
-        use std::io::Write;
-        let path = std::env::temp_dir().join("wta-event-diag.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "[{:.3}] {}", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
-        }
-    }
-    early_log("=== run_default_tui started ===");
+    let _guard = logging::init("main");
+    tracing::info!("=== run_default_tui started ===");
 
     // Debug channel for TUI debug panel (pipe traffic viewer)
     let (debug_tx, debug_rx) = tokio::sync::mpsc::unbounded_channel::<app::DebugMessage>();
@@ -1553,7 +1483,7 @@ async fn run_default_tui(cli: Cli, po: PipeOverride) -> Result<()> {
     let mut wt_pipe_channel: Option<Arc<PipeChannel>> = None;
     let wt_connected = match connect_to_wt_pipe(&po, debug_tx.clone()).await {
         Ok(channel) => {
-            early_log("Connected to WT pipe OK — subscribing to events");
+            tracing::info!("Connected to WT pipe OK — subscribing to events");
             // Subscribe to push events before wrapping in Arc.
             wt_event_rx = Some(channel.subscribe_events());
             let arc_channel = Arc::new(channel);
@@ -1562,7 +1492,7 @@ async fn run_default_tui(cli: Cli, po: PipeOverride) -> Result<()> {
             true
         }
         Err(e) => {
-            early_log(&format!("NO WT pipe: {}", e));
+            tracing::warn!(error = %e, "NO WT pipe");
             false
         }
     };
@@ -1848,40 +1778,28 @@ async fn run_acp_app(
                 }
             });
 
-            // Diagnostic log for event pipeline debugging.
-            fn diag_log(msg: &str) {
-                use std::io::Write;
-                let path = std::env::temp_dir().join("wta-event-diag.log");
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true).append(true).open(&path)
-                {
-                    let _ = writeln!(f, "[{:.3}] {}", std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs_f64(), msg);
-                }
-            }
-
             // Start the background pipe reader and trigger lazy event registration.
             // start_reader() splits the pipe and must complete before any requests.
             // get_capabilities triggers _ensurePageEventsRegistered() on the WT server.
             if let Some(ref pipe_ch) = wt_pipe_channel {
-                diag_log("start_reader: starting...");
+                tracing::info!("start_reader: starting...");
                 pipe_ch.start_reader().await;
-                diag_log("start_reader: done, sending get_capabilities...");
+                tracing::info!("start_reader: done, sending get_capabilities...");
                 match pipe_ch.request("get_capabilities", serde_json::json!({})).await {
-                    Ok(v) => diag_log(&format!("get_capabilities: OK, result={}", v)),
-                    Err(e) => diag_log(&format!("get_capabilities: FAILED: {}", e)),
+                    Ok(v) => tracing::info!(result = %v, "get_capabilities OK"),
+                    Err(e) => tracing::warn!(error = %e, "get_capabilities FAILED"),
                 }
             } else {
-                diag_log("no wt_pipe_channel — events won't work");
+                tracing::warn!("no wt_pipe_channel — events won't work");
             }
 
             // Background WT event reader: forwards push events from the pipe to the TUI.
             if let Some(mut wt_rx) = wt_event_rx {
-                diag_log("wt_event_rx: starting background reader task");
+                tracing::info!("wt_event_rx: starting background reader task");
                 let wt_event_tx = event_tx.clone();
                 tokio::task::spawn_local(async move {
                     while let Some(event_json) = wt_rx.recv().await {
-                        diag_log(&format!("wt_event_rx: received event: {}", event_json));
+                        tracing::debug!(event = %event_json, "wt_event_rx: received event");
                         let method = event_json
                             .get("method")
                             .and_then(|v| v.as_str())
@@ -1908,12 +1826,14 @@ async fn run_acp_app(
 
             let acp_event_tx = event_tx.clone();
             let shell_mgr_for_recs = Arc::clone(&shell_mgr);
+            let acp_initial_cwd = std::env::var("WTA_SOURCE_CWD").ok().filter(|s| !s.is_empty());
             tokio::task::spawn_local(protocol::acp::client::run_acp_client(
                 agent_cmd,
                 acp_event_tx,
                 prompt_rx,
                 shell_mgr,
                 wt_connected,
+                acp_initial_cwd,
             ));
 
             let (recommendation_tx, recommendation_rx) = tokio::sync::mpsc::unbounded_channel();

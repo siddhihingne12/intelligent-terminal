@@ -16,6 +16,24 @@ using namespace ::Microsoft::Console;
 namespace WDJ = ::winrt::Windows::Data::Json;
 using namespace winrt::Windows::Foundation;
 
+static void _acpLog(const std::wstring& msg)
+{
+    OutputDebugStringW(msg.c_str());
+    wchar_t localAppData[MAX_PATH];
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) == 0)
+        return;
+    const auto logDir = std::wstring(localAppData) + L"\\AgenticTerminal\\logs";
+    std::filesystem::create_directories(logDir);
+    const auto logPath = logDir + L"\\wta-acp-connection.log";
+    if (auto f = std::wofstream(logPath, std::ios::app))
+    {
+        const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        f << L"[" << (now / 1000.0) << L"] " << msg;
+    }
+}
+
 static constexpr int AGENT_TEXT_COLOR = 37; // white
 static constexpr int TOOL_CALL_COLOR = 90; // gray
 static constexpr int PLAN_COLOR = 96; // cyan
@@ -118,7 +136,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         {
             if (_agentStreaming.load())
             {
-                OutputDebugStringW(L"[AcpConnection] Ctrl+C: cancelling agent prompt\n");
+                _acpLog(L"[AcpConnection] Ctrl+C: cancelling agent prompt\n");
                 try
                 {
                     WDJ::JsonObject params;
@@ -295,7 +313,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         si.hStdError = GetStdHandle(STD_ERROR_HANDLE); // let agent stderr go to our stderr for debugging
 
         auto cmdline = wil::ExpandEnvironmentStringsW<std::wstring>(_agentCliPath.c_str());
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] Launching agent: {}\n"), cmdline).c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] Launching agent: {}\n"), cmdline));
 
         const auto startingDir = _workingDirectory.empty() ? nullptr : _workingDirectory.c_str();
 
@@ -323,9 +341,8 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         _pipeToAgent = std::move(stdinWrite);
         _pipeFromAgent = std::move(stdoutRead);
 
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] Agent process launched, PID: {}\n"),
-                                       GetProcessId(_agentProcess.hProcess))
-                               .c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] Agent process launched, PID: {}\n"),
+                            GetProcessId(_agentProcess.hProcess)));
     }
 
     // ======================================================================
@@ -351,9 +368,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         auto jsonStr = winrt::to_string(msg.Stringify());
         jsonStr.push_back('\n');
 
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] SEND: {}\n"),
-                                       winrt::to_hstring(jsonStr))
-                               .c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] SEND: {}\n"), winrt::to_hstring(jsonStr)));
 
         DWORD written;
         bool writeFailed;
@@ -411,9 +426,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
         auto jsonStr = winrt::to_string(msg.Stringify());
         jsonStr.push_back('\n');
 
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] SEND RESPONSE: {}\n"),
-                                       winrt::to_hstring(jsonStr))
-                               .c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] SEND RESPONSE: {}\n"), winrt::to_hstring(jsonStr)));
 
         DWORD written;
         std::lock_guard<std::mutex> lock{ _writeMutex };
@@ -490,9 +503,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 
     void AcpConnection::_HandleNotification(const winrt::hstring& method, const WDJ::JsonObject& params)
     {
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] NOTIFICATION: {}\n"),
-                                       std::wstring_view{ method })
-                               .c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] NOTIFICATION: {}\n"), std::wstring_view{ method }));
 
         if (method == L"session/update")
         {
@@ -519,18 +530,14 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
             }
             else
             {
-                OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] Unknown session/update type: {}\n"),
-                                               std::wstring_view{ type })
-                                       .c_str());
+                _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] Unknown session/update type: {}\n"), std::wstring_view{ type }));
             }
         }
     }
 
     void AcpConnection::_HandleAgentRequest(const winrt::hstring& method, const WDJ::JsonObject& params, int64_t id)
     {
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] AGENT REQUEST: {} (id={})\n"),
-                                       std::wstring_view{ method }, id)
-                               .c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] AGENT REQUEST: {} (id={})\n"), std::wstring_view{ method }, id));
 
         if (method == L"terminal/create")
         {
@@ -1017,9 +1024,9 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 
         auto initFuture = _SendRequest(L"initialize", initParams);
 
-        OutputDebugStringW(L"[AcpConnection] Waiting for initialize response...\n");
+        _acpLog(L"[AcpConnection] Waiting for initialize response...\n");
         auto initResult = initFuture.get();
-        OutputDebugStringW(L"[AcpConnection] Got initialize response\n");
+        _acpLog(L"[AcpConnection] Got initialize response\n");
 
         // 2. Send session/new
         WDJ::JsonObject sessionParams;
@@ -1031,13 +1038,11 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
 
         auto sessionFuture = _SendRequest(L"session/new", sessionParams);
 
-        OutputDebugStringW(L"[AcpConnection] Waiting for session/new response...\n");
+        _acpLog(L"[AcpConnection] Waiting for session/new response...\n");
         auto sessionResult = sessionFuture.get();
 
         _acpSessionId = sessionResult.GetNamedString(L"sessionId", L"");
-        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] Session established: {}\n"),
-                                       std::wstring_view{ _acpSessionId })
-                               .c_str());
+        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] Session established: {}\n"), std::wstring_view{ _acpSessionId }));
     }
 
     // ======================================================================
@@ -1120,9 +1125,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                 auto stopReason = result.GetNamedString(L"stopReason", L"");
                 if (!stopReason.empty())
                 {
-                    OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] stopReason: {}\n"),
-                                                   stopReason.c_str())
-                                           .c_str());
+                    _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] stopReason: {}\n"), stopReason.c_str()));
                 }
             }
             catch (const std::exception& e)
@@ -1213,9 +1216,7 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                         line.pop_back();
                     }
 
-                    OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] RECV: {}\n"),
-                                                   winrt::to_hstring(line))
-                                           .c_str());
+                    _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] RECV: {}\n"), winrt::to_hstring(line)));
 
                     try
                     {
@@ -1224,14 +1225,12 @@ namespace winrt::Microsoft::Terminal::TerminalConnection::implementation
                     }
                     catch (...)
                     {
-                        OutputDebugStringW(fmt::format(FMT_COMPILE(L"[AcpConnection] Failed to parse JSON: {}\n"),
-                                                       winrt::to_hstring(line))
-                                               .c_str());
+                        _acpLog(fmt::format(FMT_COMPILE(L"[AcpConnection] Failed to parse JSON: {}\n"), winrt::to_hstring(line)));
                     }
                 }
             }
 
-            OutputDebugStringW(L"[AcpConnection] Reader thread exiting (pipe closed or EOF)\n");
+            _acpLog(L"[AcpConnection] Reader thread exiting (pipe closed or EOF)\n");
 
             // Reject any pending promises so the handshake/prompt thread unblocks
             {

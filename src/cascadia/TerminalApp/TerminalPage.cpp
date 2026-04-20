@@ -960,10 +960,12 @@ namespace winrt::TerminalApp::implementation
 
     static void _agentPaneLog(const std::string& msg)
     {
-        wchar_t tmpPath[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, tmpPath) == 0)
+        wchar_t localAppData[MAX_PATH];
+        if (GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH) == 0)
             return;
-        const auto logPath = std::wstring(tmpPath) + L"wta-agent-pane.log";
+        const auto logDir = std::wstring(localAppData) + L"\\AgenticTerminal\\logs";
+        std::filesystem::create_directories(logDir);
+        const auto logPath = logDir + L"\\wta-agent-pane.log";
         if (auto f = std::ofstream(logPath, std::ios::app))
         {
             const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1214,6 +1216,51 @@ namespace winrt::TerminalApp::implementation
             cmdline += fmt::format(FMT_COMPILE(L" --delegate-model \"{}\""), modelStr);
         }
 
+        // Resolve active pane CWD so the agent host session starts in a useful directory
+        // rather than inheriting the Terminal process's system32 working directory.
+        std::wstring activeCwdForHost;
+        if (const auto& activeControl = _GetActiveControl())
+        {
+            activeCwdForHost = activeControl.WorkingDirectory();
+        }
+        if (activeCwdForHost.empty())
+        {
+            wchar_t homePath[MAX_PATH];
+            if (GetEnvironmentVariableW(L"USERPROFILE", homePath, MAX_PATH) > 0)
+            {
+                activeCwdForHost = homePath;
+            }
+        }
+
+        // Build an environment block for the host process that includes WTA_SOURCE_CWD
+        // so the Rust ACP client can use it when creating the agent session.
+        std::wstring envBlock;
+        {
+            // Copy current environment, then append/override WTA_SOURCE_CWD.
+            LPWCH envStrings = GetEnvironmentStringsW();
+            if (envStrings)
+            {
+                for (LPWCH p = envStrings; *p; p += wcslen(p) + 1)
+                {
+                    std::wstring_view entry{ p };
+                    // Skip any existing WTA_SOURCE_CWD entry.
+                    if (entry.substr(0, 14) != L"WTA_SOURCE_CWD")
+                    {
+                        envBlock.append(entry);
+                        envBlock += L'\0';
+                    }
+                }
+                FreeEnvironmentStringsW(envStrings);
+            }
+            if (!activeCwdForHost.empty())
+            {
+                envBlock += L"WTA_SOURCE_CWD=";
+                envBlock += activeCwdForHost;
+                envBlock += L'\0';
+            }
+            envBlock += L'\0'; // double-null terminator
+        }
+
         STARTUPINFOW si{};
         si.cb = sizeof(si);
         PROCESS_INFORMATION pi{};
@@ -1231,15 +1278,16 @@ namespace winrt::TerminalApp::implementation
             SetInformationJobObject(_agentHostJob, JobObjectExtendedLimitInformation, &jobInfo, sizeof(jobInfo));
         }
 
+        const wchar_t* cwdForProcess = activeCwdForHost.empty() ? nullptr : activeCwdForHost.c_str();
         if (CreateProcessW(
                 nullptr,
                 mutableCmdline.data(),
                 nullptr,
                 nullptr,
                 FALSE,
-                CREATE_NO_WINDOW | CREATE_SUSPENDED,
-                nullptr,
-                nullptr,
+                CREATE_NO_WINDOW | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
+                envBlock.empty() ? nullptr : envBlock.data(),
+                cwdForProcess,
                 &si,
                 &pi))
         {
@@ -1251,7 +1299,7 @@ namespace winrt::TerminalApp::implementation
             CloseHandle(pi.hThread);
             _agentHostProcess = pi.hProcess;
             _agentHostStarted = true;
-            _agentPaneLog("_EnsureAgentHostStarted: launched OK, cmdline=" + winrt::to_string(winrt::hstring{ cmdline }));
+            _agentPaneLog("_EnsureAgentHostStarted: launched OK, cwd=" + winrt::to_string(winrt::hstring{ activeCwdForHost }) + " cmdline=" + winrt::to_string(winrt::hstring{ cmdline }));
         }
         else
         {

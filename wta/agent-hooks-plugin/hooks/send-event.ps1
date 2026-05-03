@@ -15,7 +15,36 @@ if (-not $hookData -or -not $hookData.Trim()) { exit 0 }
 # Wrap payload and send via ProcessStartInfo to avoid PowerShell argument mangling
 try {
     $parsed = $hookData | ConvertFrom-Json
-    $payload = @{ cli_source = "copilot"; payload = $parsed } | ConvertTo-Json -Compress -Depth 5
+
+    # Extract agent_session_id from stdin JSON (Claude/Gemini), env (Copilot), or empty.
+    $agentSessionId = ""
+    if ($parsed.PSObject.Properties.Name -contains "session_id") {
+        $agentSessionId = [string]$parsed.session_id
+    } elseif ($env:COPILOT_SESSION_ID) {
+        $agentSessionId = $env:COPILOT_SESSION_ID
+    } elseif ($env:CLAUDE_SESSION_ID) {
+        $agentSessionId = $env:CLAUDE_SESSION_ID
+    } elseif ($env:GEMINI_SESSION_ID) {
+        $agentSessionId = $env:GEMINI_SESSION_ID
+    }
+
+    # Detect CLI source: prefer WTA_CLI_SOURCE (set by bash hooks); fall back
+    # to env-var sniffing; default to "copilot" for backward compat.
+    $cliSource = $env:WTA_CLI_SOURCE
+    if (-not $cliSource) {
+        if ($env:CLAUDE_PLUGIN_ROOT) { $cliSource = "claude" }
+        elseif ($env:GEMINI_CLI) { $cliSource = "gemini" }
+        elseif ($env:COPILOT_CLI) { $cliSource = "copilot" }
+        else { $cliSource = "copilot" }
+    }
+
+    $wrapper = @{
+        cli_source       = $cliSource
+        agent_session_id = $agentSessionId
+        payload          = $parsed
+    }
+
+    $payload = $wrapper | ConvertTo-Json -Compress -Depth 5
 
     # Escape quotes for raw command line: each " becomes \"
     $escaped = $payload.Replace('"', '\"')
@@ -28,5 +57,5 @@ try {
     $proc = [System.Diagnostics.Process]::Start($psi)
     $proc.WaitForExit(5000)
 } catch {
-    # Silently ignore errors
+    # Silently ignore errors — hooks must not block the agent.
 }

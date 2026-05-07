@@ -5,7 +5,7 @@
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.session.start"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.session.start"
         }]
       }
     ],
@@ -14,16 +14,16 @@
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.session.end"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.session.end"
         }]
       }
     ],
-    "UserPromptSubmit": [
+    "BeforeAgent": [
       {
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.prompt.submit"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.prompt.submit"
         }]
       }
     ],
@@ -32,7 +32,7 @@
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.tool.starting"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.tool.starting"
         }]
       }
     ],
@@ -41,7 +41,7 @@
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.tool.finished"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.tool.finished"
         }]
       }
     ],
@@ -50,16 +50,16 @@
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.notification"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.notification"
         }]
       }
     ],
-    "Stop": [
+    "AfterAgent": [
       {
         "matcher": ".*",
         "hooks": [{
           "type": "command",
-          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" agent.stop"
+          "command": "powershell -ExecutionPolicy Bypass -File \"${extensionPath}/hooks/send-event.ps1\" -CliSource gemini agent.stop"
         }]
       }
     ]

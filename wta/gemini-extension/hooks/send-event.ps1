@@ -11,8 +11,44 @@ param(
     [string]$CliSource = ""
 )
 
+# ─── diagnostic trace (round 13) ────────────────────────────────────────
+# Every hook invocation appends one line so we can diagnose missing
+# SessionEnd events on Ctrl+C without relying on wta seeing the message.
+# Writes to %LOCALAPPDATA%\IntelligentTerminal\logs\hook-trace.log.
+# Best-effort; never throws.
+$traceWritten = $false
+try {
+    $traceDir = Join-Path $env:LOCALAPPDATA 'IntelligentTerminal\logs'
+    if (-not (Test-Path -LiteralPath $traceDir)) {
+        New-Item -ItemType Directory -Path $traceDir -Force | Out-Null
+    }
+    $tracePath = Join-Path $traceDir 'hook-trace.log'
+    $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+    $cliEnvHint =
+        if ($env:COPILOT_SESSION_ID) { 'copilot' }
+        elseif ($env:GEMINI_SESSION_ID) { 'gemini' }
+        elseif ($env:CLAUDE_SESSION_ID) { 'claude' }
+        elseif ($env:GEMINI_CLI)   { 'gemini' }
+        elseif ($env:COPILOT_CLI)  { 'copilot' }
+        elseif ($env:CLAUDE_PLUGIN_ROOT) { 'claude' }
+        else { '<unknown>' }
+    $wtSess = if ($env:WT_SESSION) { $env:WT_SESSION } else { '<no-WT_SESSION>' }
+    $line = "$stamp | ENTER cli=$CliSource event=$EventType envHint=$cliEnvHint wt=$wtSess pid=$PID"
+    Add-Content -LiteralPath $tracePath -Value $line -ErrorAction SilentlyContinue
+    $traceWritten = $true
+} catch { }
+# ────────────────────────────────────────────────────────────────────────
+
 # Skip if not running inside Windows Terminal
-if (-not $env:WT_COM_CLSID) { exit 0 }
+if (-not $env:WT_COM_CLSID) {
+    if ($traceWritten) {
+        try {
+            $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+            Add-Content -LiteralPath $tracePath -Value "$stamp | SKIP no WT_COM_CLSID (cli=$CliSource event=$EventType)" -ErrorAction SilentlyContinue
+        } catch { }
+    }
+    exit 0
+}
 
 # Locate wtcli.exe. Order:
 #   1. PATH (works if the package registers a wtcli AppExecutionAlias).
@@ -119,7 +155,25 @@ try {
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardError = $true
     $proc = [System.Diagnostics.Process]::Start($psi)
-    $proc.WaitForExit(5000)
+    $exited = $proc.WaitForExit(5000)
+    if ($traceWritten) {
+        try {
+            $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+            $exitInfo = if ($exited) { "exit=$($proc.ExitCode)" } else { 'TIMEOUT_5s' }
+            $stderrSnippet = ''
+            try { $stderrSnippet = ($proc.StandardError.ReadToEnd() -replace "[\r\n]+", ' ').Trim() } catch { }
+            if ($stderrSnippet.Length -gt 200) { $stderrSnippet = $stderrSnippet.Substring(0, 200) + '...' }
+            $sessIdShort = if ($agentSessionId) { $agentSessionId.Substring(0, [Math]::Min(8, $agentSessionId.Length)) } else { '<none>' }
+            Add-Content -LiteralPath $tracePath -Value "$stamp | OK cli=$cliSource event=$EventType $exitInfo sessId=$sessIdShort wtcli=$wtcliPath stderr=`"$stderrSnippet`"" -ErrorAction SilentlyContinue
+        } catch { }
+    }
 } catch {
+    if ($traceWritten) {
+        try {
+            $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff')
+            $msg = ($_.Exception.Message -replace "[\r\n]+", ' ').Trim()
+            Add-Content -LiteralPath $tracePath -Value "$stamp | ERROR cli=$CliSource event=$EventType ex=`"$msg`"" -ErrorAction SilentlyContinue
+        } catch { }
+    }
     # Silently ignore errors — hooks must not block the agent.
 }

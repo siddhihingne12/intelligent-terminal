@@ -333,8 +333,16 @@ pub fn classify_wt_event(method: &str, session_id: &str, params: &serde_json::Va
                     acknowledged: false,
                     age_ticks: 0,
                 },
+                // Pane closure is a lifecycle event, not a fixable command
+                // failure. autofix's intended trigger is `osc:133;D;<non-zero>`
+                // (a shell command exiting non-zero). Treating `closed` as
+                // Actionable spawned a phantom autofix Copilot ACP session
+                // every time an agent CLI's pane closed (Gemini Ctrl+C,
+                // Copilot `exit`, Claude `exit`) and surfaced a noisy
+                // `winrt::hresult_error` when its first action
+                // (`wtcli ReadPaneOutput`) hit the now-dead pane.
                 "closed" => WtNotification {
-                    severity: WtEventSeverity::Actionable,
+                    severity: WtEventSeverity::Informational,
                     session_id: session_id.to_string(),
                     summary: format!("Session {}: process exited", session_id),
                     acknowledged: false,
@@ -512,6 +520,18 @@ pub enum AppEvent {
     ResumePaneCreated {
         key: crate::agent_sessions::AgentKey,
         pane_session_id: String,
+    },
+    /// `wtcli focus-pane` failed for a row that the registry believed was
+    /// live. `reason == NotFound` means WT confirmed the pane GUID is no
+    /// longer present in any window (the user closed the pane while the
+    /// row was Idle/Working — happens when an agent CLI without a working
+    /// SessionEnd hook exits and the user later reuses the same pane). In
+    /// that case the handler demotes the row to Ended so the next Enter
+    /// triggers `dispatch_resume` (split a fresh pane) instead of looping
+    /// on the stale GUID. For other failure reasons the row is left alone.
+    PaneFocusFailed {
+        pane_session_id: String,
+        reason: crate::shell::wt_channel::FocusPaneFailureReason,
     },
 }
 
@@ -944,6 +964,7 @@ impl App {
             AppEvent::InstallProgress(_) => "install_progress",
             AppEvent::InstallComplete(_) => "install_complete",
             AppEvent::ResumePaneCreated { .. } => "resume_pane_created",
+            AppEvent::PaneFocusFailed { .. } => "pane_focus_failed",
         }
     }
     fn trace_state(&self) -> String {
@@ -1301,6 +1322,26 @@ impl App {
                 // Must check before same-pane skip: agent events originate from
                 // hooks in the agent's own pane, so session_id would match ours.
                 if method == "agent_event" {
+                    // Round 15: skip events from wta's OWN ACP-Copilot subprocess.
+                    // When autofix sends a prompt to Copilot ACP, Copilot ACP
+                    // spawns a Copilot CLI subprocess with our hooks-plugin
+                    // installed; that subprocess's `UserPromptSubmit` hook
+                    // posts an `agent_event` back to wta whose
+                    // `agent_session_id` is the ACP session UUID we ourselves
+                    // hold in `self.session_id` (set by AgentConnected).
+                    // Routing that into the registry creates a phantom row
+                    // like `<asid8>-copilot-…` in F2 (e.g. when the user is
+                    // running Claude in another pane, autofix fires for some
+                    // unrelated reason and our internal Copilot ACP shows up
+                    // alongside Claude). Filter it out — the autofix
+                    // conversation is already visible in the chat pane via
+                    // the ACP protocol stream; we don't need a duplicate row.
+                    let asid_in_event = params.get("agent_session_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let is_self_acp_event = !self.session_id.is_empty()
+                        && asid_in_event == self.session_id;
+
                     // Track CLI-agent sessions in OTHER panes (not WTA's own pane).
                     // `session_id` here is the *pane* GUID ($env:WT_SESSION in
                     // the originating pane) — NOT the CLI agent's session id.
@@ -1312,7 +1353,16 @@ impl App {
                     // registry key — see the doc comment on that function.
                     //
                     // The chat-display below logs ALL agent events, including ours.
-                    if self.pane_session_id.as_deref() != Some(session_id.as_str()) {
+                    let is_own_pane = self.pane_session_id.as_deref() == Some(session_id.as_str());
+                    if is_self_acp_event {
+                        tracing::debug!(
+                            target: "agent_route",
+                            asid = %asid_in_event,
+                            event = %params.get("event").and_then(|v| v.as_str()).unwrap_or(""),
+                            pane = %session_id,
+                            "skipped registry routing: own ACP-Copilot session (autofix loop)"
+                        );
+                    } else if !is_own_pane {
                         let _ = route_agent_event_to_registry(
                             &mut self.agent_sessions,
                             &session_id,
@@ -1335,6 +1385,16 @@ impl App {
                     tracing::debug!(target: "autofix", "skipped: own pane");
                     return;
                 }
+
+                // Capture whether this pane belongs to a managed agent CLI
+                // (Copilot/Claude/Gemini/...) BEFORE applying the registry
+                // event, because PaneClosed below removes the pane mapping.
+                // We use this to suppress autofix triggering: Ctrl+C in an
+                // agent pane is not a user command failure that warrants
+                // launching another Copilot session to "diagnose" it. Doing
+                // so creates a phantom row in the F2 list and forces
+                // ReadPaneOutput against the now-dead pane (throws E_FAIL).
+                let was_agent_pane = self.agent_sessions.is_agent_pane(session_id.as_str());
 
                 // Route connection_state into the registry as well as classify_wt_event.
                 if method == "connection_state" {
@@ -1361,6 +1421,39 @@ impl App {
                     // fall through to classify_wt_event for autofix
                 }
 
+                // Round 14: detect agent CLI exit when the pane stays alive.
+                // Background: WT's `closeOnExit: graceful|never` lets the
+                // pane survive a child-process exit by respawning a shell.
+                // In that case `connection_state: closed` is never emitted
+                // and our PaneClosed path doesn't fire. Empirically (Gemini
+                // 0.41.2 Ctrl+C, repro 2026-05-07), Gemini's SessionEnd hook
+                // also fails to fire on Ctrl+C-via-/quit despite the
+                // upstream code path supposedly running it — so we cannot
+                // rely on agent.session.end for this case.
+                //
+                // Reliable signal we DO get on every shell (PowerShell with
+                // shell integration, bash with FinalTerm, etc.) the moment
+                // the shell takes over the pane: `osc:133;A` (FinalTerm
+                // prompt-start). None of our agent CLIs emit OSC 133, so
+                // an `osc:133;A` event on a pane currently bound to an
+                // active agent session means the shell has retaken
+                // control — the agent process is gone. Demote.
+                if method == "vt_sequence" && was_agent_pane {
+                    let seq = params.get("sequence").and_then(|v| v.as_str()).unwrap_or("");
+                    if seq == "osc:133;A" {
+                        use crate::agent_sessions::SessionEvent;
+                        tracing::info!(
+                            target: "agent_sessions",
+                            pane = %session_id,
+                            "shell prompt (osc:133;A) on agent pane → demoting session (agent CLI exited; pane stayed alive via closeOnExit:never)"
+                        );
+                        self.agent_sessions.apply(SessionEvent::PaneClosed {
+                            pane_session_id: session_id.clone(),
+                        });
+                        let _ = self.agent_sessions.take_dirty();
+                    }
+                }
+
                 let notification = classify_wt_event(&method, &session_id, &params);
                 tracing::debug!(target: "autofix", severity = ?notification.severity, summary = %notification.summary, "classified");
 
@@ -1384,6 +1477,23 @@ impl App {
                             if !prompt.is_empty() {
                                 self.delegate_to_tab_agent(&prompt);
                             }
+                            return;
+                        }
+
+                        // Suppress autofix when the actionable event came from an
+                        // agent CLI's own pane. The "failure" is the agent process
+                        // exiting (e.g. user Ctrl+C'd Gemini), not a user command
+                        // that needs diagnosing. Without this, an agent exit
+                        // triggers maybe_trigger_autofix → spawns a Copilot ACP
+                        // session and adds a phantom row in F2, plus an attempted
+                        // ReadPaneOutput on the dead pane that throws E_FAIL.
+                        if was_agent_pane {
+                            tracing::debug!(
+                                target: "autofix",
+                                method = %method,
+                                session_id = %session_id,
+                                "skipped: agent pane (CLI exit, not a user command failure)"
+                            );
                             return;
                         }
 
@@ -1510,6 +1620,43 @@ impl App {
                     },
                 );
                 let _ = self.agent_sessions.take_dirty();
+            }
+            AppEvent::PaneFocusFailed { pane_session_id, reason } => {
+                use crate::shell::wt_channel::FocusPaneFailureReason;
+                match reason {
+                    FocusPaneFailureReason::NotFound => {
+                        // WT confirmed the pane is gone. Demote the stuck-IDLE
+                        // row to Ended so the next Enter resumes (split a new
+                        // pane) instead of throwing again on the same GUID.
+                        // Common path: agent CLI (Gemini in particular) exited
+                        // without firing a SessionEnd hook, the user later
+                        // closed the pane manually, but the registry never
+                        // observed the demotion.
+                        tracing::info!(
+                            target: "agents_view",
+                            pane_session_id = %pane_session_id,
+                            "focus-pane returned ERROR_NOT_FOUND; demoting stale-IDLE row",
+                        );
+                        self.agent_sessions.apply(
+                            crate::agent_sessions::SessionEvent::PaneClosed {
+                                pane_session_id,
+                            },
+                        );
+                        let _ = self.agent_sessions.take_dirty();
+                    }
+                    FocusPaneFailureReason::Other { exit_code, stderr } => {
+                        // Transient/infrastructure failure (RPC, busy WT, broken
+                        // wtcli install, etc.). Don't demote — the pane may
+                        // still be live. Log and let the user retry.
+                        tracing::warn!(
+                            target: "agents_view",
+                            pane_session_id = %pane_session_id,
+                            ?exit_code,
+                            stderr = %stderr,
+                            "focus-pane failed (non-NotFound); leaving row state unchanged",
+                        );
+                    }
+                }
             }
         }
     }
@@ -3139,7 +3286,29 @@ impl App {
             "-t".to_string(),
             pane_session_id.clone(),
         ];
-        crate::shell::wt_channel::spawn_wtcli_focus_pane(&pane_session_id);
+        // Pass a failure callback so we can demote stale-IDLE rows whose
+        // pane is gone. Without this, pressing Enter on a row whose agent
+        // exited (without firing SessionEnd) and whose pane was later
+        // closed would loop on a stale GUID and surface a winrt::hresult
+        // first-chance exception in WT every time.
+        let on_failure: Option<
+            Box<dyn FnOnce(crate::shell::wt_channel::FocusPaneFailureReason) + Send + 'static>,
+        > = match self.app_event_tx.clone() {
+            Some(tx) => {
+                let pane_for_event = pane_session_id.clone();
+                Some(Box::new(move |reason| {
+                    let _ = tx.send(AppEvent::PaneFocusFailed {
+                        pane_session_id: pane_for_event,
+                        reason,
+                    });
+                }))
+            }
+            None => None,
+        };
+        crate::shell::wt_channel::spawn_wtcli_focus_pane_with_callback(
+            &pane_session_id,
+            on_failure,
+        );
         #[cfg(test)]
         {
             self.last_dispatched_command = Some(DispatchedCommand {
@@ -3739,6 +3908,458 @@ mod tests {
             "must not dispatch resume for synthetic pane:<guid> key");
     }
 
+    // ─── Round 10: stale-pane focus failure handling ───────────────────────
+
+    /// Regression: When wta dispatches focus-pane on an Idle row whose pane
+    /// was actually closed (agent CLI exited without firing SessionEnd, then
+    /// user closed the pane), WT replies HRESULT_FROM_WIN32(ERROR_NOT_FOUND).
+    /// The PaneFocusFailed handler must demote the row to Ended so the next
+    /// Enter triggers a resume instead of looping on the stale GUID.
+    #[test]
+    fn pane_focus_failed_not_found_demotes_idle_row_to_ended() {
+        use crate::agent_sessions::{AgentStatus, CliSource, SessionEvent};
+        use crate::shell::wt_channel::FocusPaneFailureReason;
+        use std::path::PathBuf;
+        let mut app = test_app();
+        let pane = "11111111-1111-1111-1111-111111111111";
+        let key  = "agent-key-1".to_string();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: key.clone(),
+            cli_source: CliSource::Gemini,
+            pane_session_id: pane.into(),
+            cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+        assert_eq!(
+            app.agent_sessions.iter_sorted()[0].status,
+            AgentStatus::Idle,
+            "precondition: row must be Idle",
+        );
+
+        app.handle_event(AppEvent::PaneFocusFailed {
+            pane_session_id: pane.into(),
+            reason: FocusPaneFailureReason::NotFound,
+        });
+
+        let row = app.agent_sessions.iter_sorted()
+            .into_iter()
+            .find(|s| s.key == key)
+            .expect("row must still exist after demotion");
+        assert_eq!(row.status, AgentStatus::Ended,
+            "NotFound focus failure must demote stale-IDLE row to Ended");
+        assert!(row.pane_session_id.is_none(),
+            "demoted row's pane binding must be cleared");
+    }
+
+    /// Counterpart to the above: a generic (non-NotFound) failure must NOT
+    /// demote the row, because the pane may still be live (transient RPC
+    /// error, busy WT, broken wtcli install, etc.). Demoting on every
+    /// failure would cause spurious resumes that spawn duplicate panes.
+    #[test]
+    fn pane_focus_failed_other_does_not_demote() {
+        use crate::agent_sessions::{AgentStatus, CliSource, SessionEvent};
+        use crate::shell::wt_channel::FocusPaneFailureReason;
+        use std::path::PathBuf;
+        let mut app = test_app();
+        let pane = "22222222-2222-2222-2222-222222222222";
+        let key  = "agent-key-2".to_string();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: key.clone(),
+            cli_source: CliSource::Gemini,
+            pane_session_id: pane.into(),
+            cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+
+        app.handle_event(AppEvent::PaneFocusFailed {
+            pane_session_id: pane.into(),
+            reason: FocusPaneFailureReason::Other {
+                exit_code: Some(1),
+                stderr: "FocusPane failed: 0x80004005\n".into(),
+            },
+        });
+
+        let row = app.agent_sessions.iter_sorted()
+            .into_iter()
+            .find(|s| s.key == key)
+            .expect("row must still exist");
+        assert_eq!(row.status, AgentStatus::Idle,
+            "non-NotFound failure must leave a live row's status unchanged");
+        assert_eq!(row.pane_session_id.as_deref(), Some(pane),
+            "non-NotFound failure must leave pane binding intact");
+    }
+
+    /// After NotFound has demoted a row to Ended, pressing Enter again should
+    /// dispatch a resume (split a fresh pane) — not call focus-pane on the
+    /// already-stale GUID, which would just throw ERROR_NOT_FOUND in WT
+    /// again and surface another first-chance exception in the debugger.
+    #[test]
+    fn enter_after_pane_focus_not_found_demotion_dispatches_resume() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use crate::shell::wt_channel::FocusPaneFailureReason;
+        use std::path::PathBuf;
+        let mut app = test_app();
+        let pane = "33333333-3333-3333-3333-333333333333";
+        // Use a non-synthetic key (no "pane:" prefix) so dispatch_resume
+        // doesn't bail out on the synthetic-row early-return at the top of
+        // dispatch_resume. Real Gemini/Claude keys are agent-session UUIDs.
+        let key  = "real-agent-uuid-aaaa".to_string();
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: key.clone(),
+            cli_source: CliSource::Gemini,
+            pane_session_id: pane.into(),
+            cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+
+        // Stale focus failure demotes the row.
+        app.handle_event(AppEvent::PaneFocusFailed {
+            pane_session_id: pane.into(),
+            reason: FocusPaneFailureReason::NotFound,
+        });
+
+        // Locate the row's index in the sorted view so handle_key targets it.
+        let idx = app.agent_sessions.iter_sorted()
+            .iter().position(|s| s.key == key)
+            .expect("row must exist after demotion");
+        app.current_view = View::Agents;
+        app.agents_list_state.select(Some(idx));
+        app.last_dispatched_command = None;
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let cmd = app.last_dispatched_command_for_test()
+            .expect("Enter on Ended row must dispatch resume");
+        assert_eq!(cmd.kind, DispatchedCommandKind::SplitPaneResume,
+            "after NotFound demotion, Enter must split-pane resume, not focus-pane");
+    }
+
+    /// PaneFocusFailed for an unknown pane GUID is a no-op (idempotent).
+    /// Common race: two consecutive Enters on the same stale row both fire
+    /// focus-pane; the first demotes, the second arrives after demotion and
+    /// must not crash.
+    #[test]
+    fn pane_focus_failed_unknown_pane_is_noop() {
+        use crate::shell::wt_channel::FocusPaneFailureReason;
+        let mut app = test_app();
+        let session_count_before = app.agent_sessions.iter_sorted().len();
+        app.handle_event(AppEvent::PaneFocusFailed {
+            pane_session_id: "99999999-9999-9999-9999-999999999999".into(),
+            reason: FocusPaneFailureReason::NotFound,
+        });
+        assert_eq!(
+            app.agent_sessions.iter_sorted().len(),
+            session_count_before,
+            "PaneFocusFailed for unknown pane must not insert or remove rows",
+        );
+    }
+
+    // ─── Round 11: agent-pane autofix suppression ─────────────────────────
+
+    /// is_agent_pane returns true for any pane currently bound to a CLI
+    /// agent session via SessionStarted, false otherwise.
+    #[test]
+    fn is_agent_pane_reflects_active_pane_binding() {
+        use crate::agent_sessions::{AgentSessionRegistry, CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut reg = AgentSessionRegistry::new();
+        let pane = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        assert!(!reg.is_agent_pane(pane), "empty registry should report no agent pane");
+
+        reg.apply(SessionEvent::SessionStarted {
+            key: "k1".into(),
+            cli_source: CliSource::Gemini,
+            pane_session_id: pane.into(),
+            cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+        assert!(reg.is_agent_pane(pane), "after SessionStarted, the pane should be reported as agent-owned");
+
+        reg.apply(SessionEvent::PaneClosed { pane_session_id: pane.into() });
+        assert!(!reg.is_agent_pane(pane),
+            "after PaneClosed, the active_by_pane mapping is removed and is_agent_pane must return false");
+    }
+
+    /// Regression for the phantom-row + first-chance-exception bug:
+    /// a `connection_state: closed` event for an agent CLI pane (e.g. user
+    /// Ctrl+C'd Gemini) MUST NOT trigger autofix. Doing so spawns a Copilot
+    /// ACP session that shows up as a phantom row in F2 and tries to
+    /// ReadPaneOutput on a now-dead pane (throws E_FAIL).
+    #[test]
+    fn connection_state_closed_on_agent_pane_does_not_trigger_autofix() {
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        // Make sure autofix WOULD trigger if the pane weren't agent-owned.
+        app.autofix_enabled = true;
+        app.state = ConnectionState::Connected;
+        // wta's own pane is something different so the "skip own pane" guard doesn't fire.
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+
+        let agent_pane = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "real-gemini-uuid".into(),
+            cli_source: CliSource::Gemini,
+            pane_session_id: agent_pane.into(),
+            cwd: PathBuf::from("/x"), title: "t".into(),
+        });
+
+        let mut params = serde_json::Map::new();
+        params.insert("state".into(), serde_json::Value::String("closed".into()));
+        app.handle_event(AppEvent::WtEvent {
+            method: "connection_state".into(),
+            session_id: agent_pane.into(),
+            params: serde_json::Value::Object(params),
+        });
+
+        assert!(app.autofix_session_id.is_none(),
+            "agent CLI exit must not arm autofix (no phantom Copilot ACP row)");
+        assert!(!app.prompt_in_flight,
+            "agent CLI exit must not send an autofix prompt");
+    }
+
+    /// Counterpart: a real shell-command failure (osc:133;D;<non-zero>) on a
+    /// non-agent pane MUST still trigger autofix — the suppression is targeted,
+    /// not blanket. Closed events no longer trigger autofix at all (round 13:
+    /// pane lifecycle is not a fixable failure), so the autofix-on-shell
+    /// trigger is verified via vt_sequence here.
+    #[test]
+    fn shell_command_failure_on_non_agent_pane_still_triggers_autofix() {
+        let mut app = test_app();
+        app.autofix_enabled = true;
+        app.state = ConnectionState::Connected;
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+
+        let regular_pane = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+        // No SessionStarted — this pane is just a regular shell.
+
+        let mut params = serde_json::Map::new();
+        params.insert("sequence".into(), serde_json::Value::String("osc:133;D;1".into()));
+        app.handle_event(AppEvent::WtEvent {
+            method: "vt_sequence".into(),
+            session_id: regular_pane.into(),
+            params: serde_json::Value::Object(params),
+        });
+
+        assert_eq!(app.autofix_session_id.as_deref(), Some(regular_pane),
+            "regular pane shell-command failure should still arm autofix on the failing pane");
+    }
+
+    /// Round 13 regression: even when the agent CLI's SessionEnd hook fires
+    /// BEFORE `connection_state: closed` (which removes the pane from
+    /// active_by_pane via SessionStopped), the close event must NOT trigger
+    /// autofix. Round 12's `was_agent_pane` check alone fails this scenario
+    /// because the binding was already cleared by SessionStopped. The fix
+    /// (round 13) reclassifies `closed` as Informational so autofix never
+    /// triggers on pane lifecycle events for any CLI.
+    #[test]
+    fn closed_after_session_stopped_does_not_trigger_autofix() {
+        use crate::agent_sessions::{CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        app.autofix_enabled = true;
+        app.state = ConnectionState::Connected;
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+
+        let agent_pane = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        // 1. Copilot session starts, hooks bind the pane.
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "copilot-key".into(),
+            cli_source: CliSource::Copilot,
+            pane_session_id: agent_pane.into(),
+            cwd: PathBuf::from("/x"),
+            title: "t".into(),
+        });
+        // 2. User types `exit` → Copilot's SessionEnd fires → wta routes to
+        //    SessionStopped → clears active_by_pane[agent_pane].
+        app.agent_sessions.apply(SessionEvent::SessionStopped {
+            key: "copilot-key".into(),
+            reason: "user_exit".into(),
+        });
+        // Sanity: pane is no longer registered as agent-owned.
+        assert!(!app.agent_sessions.is_agent_pane(agent_pane));
+
+        // 3. cmd /c exits, pane closes → connection_state: closed arrives.
+        let mut params = serde_json::Map::new();
+        params.insert("state".into(), serde_json::Value::String("closed".into()));
+        app.handle_event(AppEvent::WtEvent {
+            method: "connection_state".into(),
+            session_id: agent_pane.into(),
+            params: serde_json::Value::Object(params),
+        });
+
+        // Must NOT have armed autofix → no phantom Copilot ACP row in F2,
+        // no winrt::hresult_error from ReadPaneOutput on the dead pane.
+        assert!(app.autofix_session_id.is_none(),
+            "agent-CLI graceful exit (SessionEnd → close) must not arm autofix");
+        assert!(!app.prompt_in_flight,
+            "agent-CLI graceful exit must not send an autofix prompt");
+    }
+
+    /// Round 14 regression: when the user has WT `closeOnExit: never|graceful`,
+    /// Ctrl+C'ing Gemini exits the CLI but the pane stays alive — WT respawns
+    /// the user's default shell (PowerShell) in the same pane. No
+    /// `connection_state: closed` is emitted, and Gemini's SessionEnd hook
+    /// is unreliable (Gemini 0.41.2 doesn't fire it on Ctrl+C-via-/quit).
+    /// The reliable signal we DO get is `osc:133;A` (FinalTerm prompt-start)
+    /// from the freshly-spawned shell. wta must use that to demote the
+    /// agent session — otherwise the row stays IDLE forever.
+    #[test]
+    fn osc_133a_on_agent_pane_demotes_session_when_pane_stays_alive() {
+        use crate::agent_sessions::{AgentStatus, CliSource, SessionEvent};
+        use std::path::PathBuf;
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+
+        let agent_pane = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+        // Gemini session is live, bound to this pane.
+        app.agent_sessions.apply(SessionEvent::SessionStarted {
+            key: "real-gemini-uuid".into(),
+            cli_source: CliSource::Gemini,
+            pane_session_id: agent_pane.into(),
+            cwd: PathBuf::from("/x"),
+            title: "t".into(),
+        });
+        assert!(app.agent_sessions.is_agent_pane(agent_pane));
+
+        // User Ctrl+C's Gemini. cmd /c gemini exits → WT respawns PowerShell
+        // in the same pane. PowerShell with shell-integration emits OSC 133;A
+        // when its prompt becomes ready.
+        let mut params = serde_json::Map::new();
+        params.insert("sequence".into(), serde_json::Value::String("osc:133;A".into()));
+        app.handle_event(AppEvent::WtEvent {
+            method: "vt_sequence".into(),
+            session_id: agent_pane.into(),
+            params: serde_json::Value::Object(params),
+        });
+
+        // Pane→session binding cleared, status flipped to Ended (renders empty).
+        assert!(!app.agent_sessions.is_agent_pane(agent_pane),
+            "osc:133;A from a respawned shell must clear the agent pane binding");
+        let entry = app.agent_sessions.iter_sorted().into_iter()
+            .find(|s| s.key == "real-gemini-uuid")
+            .expect("session must still exist as a Historical/Ended row");
+        assert_eq!(entry.status, AgentStatus::Ended,
+            "agent session must be demoted to Ended when shell takes over its pane");
+        assert!(entry.pane_session_id.is_none());
+    }
+
+    /// Counterpart: `osc:133;A` on a regular (non-agent) pane is just a
+    /// normal shell prompt mark. It must NOT demote anything (there's no
+    /// session to demote) and must NOT trigger autofix.
+    #[test]
+    fn osc_133a_on_non_agent_pane_is_a_noop() {
+        let mut app = test_app();
+        app.autofix_enabled = true;
+        app.state = ConnectionState::Connected;
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+
+        let regular_pane = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+        let mut params = serde_json::Map::new();
+        params.insert("sequence".into(), serde_json::Value::String("osc:133;A".into()));
+        app.handle_event(AppEvent::WtEvent {
+            method: "vt_sequence".into(),
+            session_id: regular_pane.into(),
+            params: serde_json::Value::Object(params),
+        });
+
+        assert!(app.autofix_session_id.is_none(),
+            "osc:133;A is a normal prompt event, not a failure → no autofix");
+        assert!(!app.agent_sessions.is_agent_pane(regular_pane));
+    }
+
+    /// Round 15 regression: when wta talks to its own headless Copilot
+    /// ACP subprocess (autofix), Copilot ACP spawns a Copilot CLI with
+    /// our hooks-plugin installed, whose `UserPromptSubmit` hook posts
+    /// an `agent_event` back to wta carrying `agent_session_id` =
+    /// `self.session_id` (the ACP session UUID we captured at
+    /// AgentConnected). Routing that into the registry creates a
+    /// phantom `<asid8>-copilot-…` row in F2 alongside the real
+    /// user-launched session. We must filter those self-emitted events
+    /// out of the registry routing.
+    #[test]
+    fn agent_event_for_own_acp_session_does_not_create_phantom_row() {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        // Our pane is something different from where the hook event lands.
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+        // wta's own ACP session id (set normally by AppEvent::AgentConnected
+        // when the headless Copilot ACP returns a session UUID).
+        let acp_uuid = "43f8e20c-3576-43ae-844a-8394da03704d";
+        app.session_id = acp_uuid.to_string();
+
+        // Snapshot how many sessions exist beforehand.
+        let before = app.agent_sessions.iter_sorted().len();
+
+        // Simulate Copilot CLI's UserPromptSubmit hook firing inside the
+        // ACP-spawned subprocess — it lands as agent_event on a pane
+        // (here we use a *different* pane to demonstrate the bug: the
+        // hook may run inside any pane; existing pane filter only skips
+        // wta's own pane, so the asid filter is what catches this).
+        let other_pane = "753BED37-5D30-46A4-BF87-A2D424CC5804";
+        let params = serde_json::json!({
+            "agent_session_id": acp_uuid,
+            "cli_source": "copilot",
+            "event": "agent.prompt.submit",
+            "payload": {
+                "cwd": "C:\\Users\\yuazha",
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "A command failed in the terminal. Diagnose..."
+            }
+        });
+        app.handle_event(AppEvent::WtEvent {
+            method: "agent_event".into(),
+            session_id: other_pane.into(),
+            params,
+        });
+
+        // Registry must NOT have grown: the self-ACP event was filtered.
+        let after = app.agent_sessions.iter_sorted().len();
+        assert_eq!(before, after,
+            "agent_event whose agent_session_id == App.session_id (own ACP-Copilot \
+             subprocess) must not synthesise a phantom session row in F2");
+        // Specifically: no row for the ACP UUID exists.
+        let phantom = app.agent_sessions.iter_sorted().into_iter()
+            .find(|s| s.key == acp_uuid);
+        assert!(phantom.is_none(),
+            "no F2 row should be created for wta's own ACP-Copilot session");
+    }
+
+    /// Counterpart: a real user-launched Copilot session in another pane
+    /// (different agent_session_id from our ACP) MUST still be tracked.
+    /// The asid filter must be precise — it should not over-match.
+    #[test]
+    fn agent_event_for_other_copilot_session_still_tracked() {
+        let mut app = test_app();
+        app.state = ConnectionState::Connected;
+        app.pane_session_id = Some("00000000-0000-0000-0000-000000000001".into());
+        // wta's own ACP session.
+        app.session_id = "43f8e20c-3576-43ae-844a-8394da03704d".to_string();
+
+        // A *different* user-launched Copilot session.
+        let user_copilot_asid = "11111111-2222-3333-4444-555555555555";
+        let other_pane = "ABCDEF12-3456-7890-ABCD-EF1234567890";
+        let params = serde_json::json!({
+            "agent_session_id": user_copilot_asid,
+            "cli_source": "copilot",
+            "event": "agent.prompt.submit",
+            "payload": {
+                "cwd": "C:\\Users\\yuazha",
+                "hook_event_name": "UserPromptSubmit",
+                "prompt": "real user prompt"
+            }
+        });
+        app.handle_event(AppEvent::WtEvent {
+            method: "agent_event".into(),
+            session_id: other_pane.into(),
+            params,
+        });
+
+        // The real user session must appear in the registry.
+        let row = app.agent_sessions.iter_sorted().into_iter()
+            .find(|s| s.key == user_copilot_asid)
+            .expect("real user-launched Copilot session must still create an F2 row");
+        assert_eq!(row.cli_source, crate::agent_sessions::CliSource::Copilot);
+    }
+
     // ─── word boundary helpers ──────────────────────────────────────────────
 
     #[test]
@@ -3812,10 +4433,15 @@ mod tests {
     }
 
     #[test]
-    fn classify_connection_closed_is_actionable() {
+    fn classify_connection_closed_is_informational() {
+        // Pane closure is a lifecycle event — registry handles it via
+        // PaneClosed/SessionStopped to demote rows. Autofix is for shell
+        // command failures (osc:133;D;<non-zero>), not pane lifecycle.
+        // Classifying `closed` as Actionable was the cause of phantom autofix
+        // Copilot ACP rows on agent-CLI exits.
         let params = json!({"session_id": "5", "state": "closed"});
         let n = classify_wt_event("connection_state", "5", &params);
-        assert_eq!(n.severity, WtEventSeverity::Actionable);
+        assert_eq!(n.severity, WtEventSeverity::Informational);
         assert!(n.summary.contains("exited"));
     }
 
@@ -3936,10 +4562,12 @@ mod tests {
     fn wt_event_actionable_shows_banner_and_triggers_autofix() {
         let mut app = test_app();
         app.state = ConnectionState::Connected;
+        // Use a real shell-command failure (osc:133;D;<non-zero>) — the only
+        // remaining trigger after round 13 (`closed` is now Informational).
         app.handle_event(AppEvent::WtEvent {
-            method: "connection_state".to_string(),
+            method: "vt_sequence".to_string(),
             session_id: "5".to_string(),
-            params: json!({"session_id": "5", "state": "closed"}),
+            params: json!({"session_id": "5", "sequence": "osc:133;D;1"}),
         });
         assert!(app.show_notification_banner);
         // Actionable events go through maybe_trigger_autofix which pushes Error (red dot)
@@ -3994,13 +4622,14 @@ mod tests {
     #[test]
     fn notification_badge_returns_most_recent_unacknowledged() {
         let mut app = test_app();
-        // First event
+        // First event — actionable shell-command failure on pane 1.
+        // (round 13: `closed` is now Informational, so we use vt_sequence.)
         app.handle_event(AppEvent::WtEvent {
-            method: "connection_state".to_string(),
+            method: "vt_sequence".to_string(),
             session_id: "1".to_string(),
-            params: json!({"session_id": "1", "state": "closed"}),
+            params: json!({"session_id": "1", "sequence": "osc:133;D;1"}),
         });
-        // Second event (more recent)
+        // Second event (more recent) — critical connection failure on pane 2.
         app.handle_event(AppEvent::WtEvent {
             method: "connection_state".to_string(),
             session_id: "2".to_string(),
@@ -4110,11 +4739,12 @@ mod tests {
             session_id: "2".to_string(),
             params: json!({"session_id": "2", "state": "failed"}),
         });
-        // Actionable from pane 3
+        // Actionable from pane 3 — round 13: `closed` is no longer
+        // actionable, so use a real shell-command failure.
         app.handle_event(AppEvent::WtEvent {
-            method: "connection_state".to_string(),
+            method: "vt_sequence".to_string(),
             session_id: "3".to_string(),
-            params: json!({"session_id": "3", "state": "closed"}),
+            params: json!({"session_id": "3", "sequence": "osc:133;D;1"}),
         });
 
         assert_eq!(app.wt_notifications.len(), 3);

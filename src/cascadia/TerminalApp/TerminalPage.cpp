@@ -3661,28 +3661,36 @@ namespace winrt::TerminalApp::implementation
                 });
 
             term.ConnectionStateChanged(
-                [weakThis = get_weak(), weakTerm](const auto& sender, auto&&) {
+                [weakThis = get_weak(), weakTerm](const auto& /*sender*/, auto&&) {
                     auto strongThis = weakThis.get();
                     if (!strongThis)
                         return;
 
-                    std::string stateStr = "unknown";
-                    if (const auto control = sender.try_as<winrt::Microsoft::Terminal::Control::TermControl>())
+                    // NOTE: `sender` here is NOT the TermControl. TermControl
+                    // bubble-forwards this event from its inner ControlCore via
+                    // BUBBLED_FORWARDED_TYPED_EVENT, which passes the original
+                    // sender through unchanged. So `sender` is the ControlCore
+                    // and `try_as<TermControl>()` always returns null, which
+                    // would leave stateStr permanently "unknown" and the switch
+                    // dead code. Read state from the captured weakTerm instead.
+                    auto control = weakTerm.get();
+                    if (!control)
+                        return;
+
+                    std::string stateStr;
+                    switch (control.ConnectionState())
                     {
-                        switch (control.ConnectionState())
-                        {
-                        case ConnectionState::Connected:
-                            stateStr = "connected";
-                            break;
-                        case ConnectionState::Closed:
-                            stateStr = "closed";
-                            break;
-                        case ConnectionState::Failed:
-                            stateStr = "failed";
-                            break;
-                        default:
-                            return;
-                        }
+                    case ConnectionState::Connected:
+                        stateStr = "connected";
+                        break;
+                    case ConnectionState::Closed:
+                        stateStr = "closed";
+                        break;
+                    case ConnectionState::Failed:
+                        stateStr = "failed";
+                        break;
+                    default:
+                        return;
                     }
 
                     // Dispatch to UI thread: _FindSessionIdForControl accesses _tabs.
@@ -3694,10 +3702,12 @@ namespace winrt::TerminalApp::implementation
                             if (!page)
                                 return;
 
-                            // Autofix pipeline: skip forwarding if disabled at runtime.
-                            if (!page->_settings.GlobalSettings().AutoFixEnabled())
-                                return;
-
+                            // connection_state is pane-lifecycle plumbing that
+                            // wta needs regardless of AutoFix being enabled —
+                            // it drives F2 session-list demotion (PaneClosed)
+                            // when an agent CLI exits and the pane is closed.
+                            // Volume is low (a handful of events per pane
+                            // lifecycle), so always forward.
                             const auto sessionIdStr = term2
                                 ? page->_FindSessionIdForControl(term2)
                                 : std::string{};

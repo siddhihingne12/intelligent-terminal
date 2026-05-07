@@ -373,6 +373,15 @@ impl AgentSessionRegistry {
         self.sessions.contains_key(key)
     }
 
+    /// Returns true if the given pane GUID is currently bound to an agent
+    /// CLI session (Copilot/Claude/Gemini/...). Used by the autofix path to
+    /// suppress "command failed" classification when the failing process is
+    /// actually one of our managed agent CLIs exiting — Ctrl+C in Gemini is
+    /// not a user command failure that needs auto-fix.
+    pub fn is_agent_pane(&self, pane_session_id: &str) -> bool {
+        self.active_by_pane.contains_key(pane_session_id)
+    }
+
     pub fn remove(&mut self, key: &AgentKey) {
         if let Some(s) = self.sessions.remove(key) {
             if let Some(pane) = s.pane_session_id {

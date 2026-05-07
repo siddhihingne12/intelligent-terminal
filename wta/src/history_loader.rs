@@ -43,6 +43,38 @@ use crate::agent_sessions::{AgentSession, AgentStatus, CliSource};
 const MAX_PER_CLI: usize = 50;
 const TITLE_TAIL_BYTES: u64 = 64 * 1024;
 
+/// Fingerprint of wta's embedded auto-fix prompt template
+/// (`wta/prompts/auto-fix.md` first sentence). Whenever wta opens its
+/// internal headless Copilot ACP connection for autofix, Copilot CLI
+/// persists a real `~/.copilot/session-state/<acp-uuid>/{workspace.yaml,
+/// events.jsonl}` for that ACP session. The first prompt in
+/// `events.jsonl` is always the autofix template, which begins with this
+/// fixed sentence — none of a user's hand-typed Copilot prompts would
+/// start that way. So we use it as a fingerprint to recognise (and
+/// hide) wta's own autofix sessions in F2's Historical list.
+///
+/// Note: if a user customises `~/.copilot/prompts/auto-fix.md` to begin
+/// differently, their phantom rows won't be filtered. Acceptable
+/// trade-off; restoring the default would re-enable filtering.
+const AUTOFIX_PROMPT_FINGERPRINT: &str = "A command failed in the terminal. Look at the output below";
+
+/// Returns true iff `events.jsonl` of a Copilot session-state dir
+/// looks like wta's own autofix ACP session (its first prompt matches
+/// the autofix-template fingerprint). We only need to peek at the head
+/// of the file because the first prompt is written within the first
+/// few KB.
+fn is_wta_autofix_copilot_session(events_jsonl: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = fs::File::open(events_jsonl) else { return false };
+    let mut buf = [0u8; 8192];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let head = String::from_utf8_lossy(&buf[..n]);
+    head.contains(AUTOFIX_PROMPT_FINGERPRINT)
+}
+
 pub fn load_all() -> Vec<AgentSession> {
     let mut out = Vec::new();
     let Some(home) = home_dir() else { return out };
@@ -70,7 +102,15 @@ pub fn lookup_title_for_session(cli: CliSource, key: &str) -> Option<String> {
 }
 
 fn copilot_title_for_key(home: &Path, key: &str) -> Option<String> {
-    let workspace = home.join(".copilot").join("session-state").join(key).join("workspace.yaml");
+    let dir = home.join(".copilot").join("session-state").join(key);
+    let workspace = dir.join("workspace.yaml");
+    // Defensive: also skip title lookup for wta-internal autofix sessions.
+    // Normally these don't exist as live keys (the round-15 routing
+    // filter blocks them), but a stale lookup must still be a no-op.
+    let events = dir.join("events.jsonl");
+    if events.is_file() && is_wta_autofix_copilot_session(&events) {
+        return None;
+    }
     let yaml = fs::read_to_string(&workspace).ok()?;
     parse_simple_yaml(&yaml, "summary").filter(|s| !s.is_empty())
         .or_else(|| parse_simple_yaml(&yaml, "name").filter(|s| !s.is_empty()))
@@ -151,6 +191,22 @@ fn load_copilot(home: &Path) -> Vec<AgentSession> {
             .map(|m| m.is_file() && m.len() > 0)
             .unwrap_or(false);
         if !has_real_activity { continue; }
+
+        // Round 16: skip wta's own autofix ACP sessions. When wta opens
+        // its headless Copilot ACP connection, Copilot CLI persists the
+        // session under ~/.copilot/session-state/<uuid>/ exactly like a
+        // user-launched Copilot session — and on the next wta startup
+        // history_loader would surface it in F2 as a "phantom"
+        // <uuid8>-copilot-… Historical row that the user never created.
+        // Filter by fingerprint of our embedded autofix prompt template.
+        if is_wta_autofix_copilot_session(&events) {
+            tracing::debug!(
+                target: "history_loader",
+                key = %id,
+                "skipping wta-internal autofix Copilot session-state dir"
+            );
+            continue;
+        }
 
         let last_activity = events.metadata()
             .and_then(|m| m.modified()).ok()
@@ -666,6 +722,56 @@ mod tests {
         let v = load_copilot(&home);
         assert_eq!(v.len(), 1, "only the real session should be loaded");
         assert_eq!(v[0].key, real);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    /// Round 16: wta's own headless Copilot ACP session for autofix
+    /// persists to `~/.copilot/session-state/<acp-uuid>/` exactly like
+    /// a user-launched Copilot session. Without filtering, every wta
+    /// startup would surface a phantom `<uuid8>-copilot-…` Historical
+    /// row in F2 that the user never created. We detect these by the
+    /// fingerprint of our embedded autofix prompt template.
+    #[test]
+    fn copilot_loader_skips_wta_internal_autofix_sessions() {
+        let home = tmp_root("copilot-autofix-skip");
+        let base = home.join(".copilot").join("session-state");
+
+        // Real user-launched Copilot session — must be loaded.
+        let user_sid = "aaaaaaaa-1111-1111-1111-111111111111";
+        let user_dir = base.join(user_sid);
+        fs::create_dir_all(&user_dir).unwrap();
+        write_file(&user_dir.join("workspace.yaml"),
+            "id: aaaaaaaa-1111-1111-1111-111111111111\n\
+             cwd: C:\\Users\\me\\repo\n\
+             summary: Fix login bug\n");
+        write_file(&user_dir.join("events.jsonl"),
+            "{\"type\":\"prompt\",\"prompt\":\"please fix the login bug\"}\n");
+
+        // wta-internal autofix ACP session — must be SKIPPED.
+        let autofix_sid = "bd280482-995a-4ba6-81ca-e2251b2aa3da";
+        let autofix_dir = base.join(autofix_sid);
+        fs::create_dir_all(&autofix_dir).unwrap();
+        write_file(&autofix_dir.join("workspace.yaml"),
+            "id: bd280482-995a-4ba6-81ca-e2251b2aa3da\n\
+             cwd: C:\\Users\\yuazha\n\
+             summary: \n");
+        // First event carries the autofix prompt fingerprint.
+        write_file(&autofix_dir.join("events.jsonl"),
+            "{\"type\":\"prompt\",\"prompt\":\"A command failed in the terminal. \
+             Look at the output below and decide how to help the user.\"}\n");
+
+        let v = load_copilot(&home);
+        assert_eq!(v.len(), 1,
+            "wta's own autofix ACP session must be filtered out of historical");
+        assert_eq!(v[0].key, user_sid,
+            "only the real user-launched Copilot session should appear");
+
+        // Defensive: title lookup must also be a no-op for the autofix dir.
+        assert_eq!(copilot_title_for_key(&home, autofix_sid), None,
+            "title lookup for an autofix session must return None");
+        assert!(copilot_title_for_key(&home, user_sid).is_some(),
+            "title lookup for the user session must still work");
+
         let _ = fs::remove_dir_all(&home);
     }
 

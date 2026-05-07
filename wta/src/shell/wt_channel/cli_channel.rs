@@ -56,11 +56,41 @@ fn resolve_wtcli_path() -> String {
     "wtcli".to_string()
 }
 
+/// Classification of a `wtcli focus-pane` failure. Lets wta tell apart
+/// "pane GUID is no longer in any window" (caller should demote the
+/// stale row) from transient/infrastructure failures (caller should
+/// leave the row alone).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FocusPaneFailureReason {
+    /// Confirmed: the COM server iterated all windows/pages and no pane
+    /// matched the supplied GUID. WT signals this via
+    /// `HRESULT_FROM_WIN32(ERROR_NOT_FOUND)` (= 0x80070490). Safe to demote.
+    NotFound,
+    /// Generic non-zero exit (legacy `E_FAIL` from older WT builds, RPC
+    /// failure, broken wtcli install, etc.). Caller should NOT demote on this
+    /// because the pane may still be live — log only.
+    Other { exit_code: Option<i32>, stderr: String },
+}
+
 /// Run `wtcli focus-pane -t <id>` on a background thread and log stdout/stderr
 /// on failure. Replaces `spawn_wtcli_async` for the focus-pane case so that
 /// silent failures (wrong GUID, dead pane, COM error) leave a trace in
 /// wta-main.log.
+///
+/// Thin wrapper over `spawn_wtcli_focus_pane_with_callback` for callers that
+/// don't care about distinguishing failure modes.
 pub fn spawn_wtcli_focus_pane(pane_session_id: &str) {
+    spawn_wtcli_focus_pane_with_callback(pane_session_id, None);
+}
+
+/// Same as `spawn_wtcli_focus_pane` but invokes `on_failure` (on the worker
+/// thread) when the spawned wtcli process exits non-zero. Used by
+/// `dispatch_focus_pane` to demote stale-IDLE rows back to `Ended` when the
+/// underlying pane is gone (`FocusPaneFailureReason::NotFound`).
+pub fn spawn_wtcli_focus_pane_with_callback(
+    pane_session_id: &str,
+    on_failure: Option<Box<dyn FnOnce(FocusPaneFailureReason) + Send + 'static>>,
+) {
     let path = resolve_wtcli_path();
     let pane = pane_session_id.to_string();
     std::thread::spawn(move || {
@@ -73,7 +103,7 @@ pub fn spawn_wtcli_focus_pane(pane_session_id: &str) {
             .output();
         match res {
             Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
                 if out.status.success() {
                     tracing::info!(
                         target: "wtcli",
@@ -81,13 +111,31 @@ pub fn spawn_wtcli_focus_pane(pane_session_id: &str) {
                         "focus-pane succeeded",
                     );
                 } else {
+                    let exit_code = out.status.code();
+                    // wtcli prints `FocusPane failed: 0x80070490` for
+                    // ERROR_NOT_FOUND. Match the literal HRESULT in stderr
+                    // — this is the only signal we have from a void IDL
+                    // method whose projection can't return a structured
+                    // result.
+                    let reason = if stderr.contains("0x80070490") {
+                        FocusPaneFailureReason::NotFound
+                    } else {
+                        FocusPaneFailureReason::Other {
+                            exit_code,
+                            stderr: stderr.clone(),
+                        }
+                    };
                     tracing::warn!(
                         target: "wtcli",
                         target_pane = %pane,
-                        code = out.status.code(),
+                        code = exit_code,
                         stderr = %stderr,
+                        reason = ?reason,
                         "focus-pane exited non-zero",
                     );
+                    if let Some(cb) = on_failure {
+                        cb(reason);
+                    }
                 }
             }
             Err(err) => {
@@ -97,6 +145,9 @@ pub fn spawn_wtcli_focus_pane(pane_session_id: &str) {
                     %err,
                     "focus-pane spawn failed",
                 );
+                // Don't fire on_failure for spawn errors (wtcli not on PATH,
+                // permission issues, etc.) — these are infrastructure
+                // problems, not "pane gone".
             }
         }
     });

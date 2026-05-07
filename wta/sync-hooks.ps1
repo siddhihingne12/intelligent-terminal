@@ -13,7 +13,7 @@ $wta  = Join-Path $repo 'wta'
 $pairs = @(
     @{
         Src = (Join-Path $wta 'agent-hooks-plugin\hooks\send-event.ps1')
-        Dst = (Join-Path $env:USERPROFILE '.copilot\installed-plugins\_direct\agent-hooks-plugin\hooks\send-event.ps1')
+        Dst = (Join-Path $env:USERPROFILE '.copilot\installed-plugins\wt-local\wt-agent-hooks\hooks\send-event.ps1')
     },
     @{
         Src = (Join-Path $wta 'gemini-extension\hooks\send-event.ps1')
@@ -21,7 +21,7 @@ $pairs = @(
     },
     @{
         Src = (Join-Path $wta 'agent-hooks-plugin\hooks\hooks.json')
-        Dst = (Join-Path $env:USERPROFILE '.copilot\installed-plugins\_direct\agent-hooks-plugin\hooks\hooks.json')
+        Dst = (Join-Path $env:USERPROFILE '.copilot\installed-plugins\wt-local\wt-agent-hooks\hooks\hooks.json')
     },
     @{
         Src = (Join-Path $wta 'gemini-extension\hooks\hooks.json')

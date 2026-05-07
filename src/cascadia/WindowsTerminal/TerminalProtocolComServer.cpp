@@ -631,7 +631,11 @@ void TerminalProtocolComServer::FocusPane(winrt::guid sessionId)
             return;
     }
 
-    winrt::throw_hresult(E_FAIL);
+    // Distinguish "pane GUID is unknown" (stale row) from generic E_FAIL so
+    // wta can identify a stuck-IDLE row whose pane was already closed and
+    // demote it to Ended rather than retrying focus indefinitely. wtcli
+    // catches this and surfaces it via the FocusPane stderr/HRESULT.
+    winrt::throw_hresult(HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
 }
 
 void TerminalProtocolComServer::SetSessionVariable(

@@ -3,8 +3,10 @@ mod cli_channel;
 pub use cli_channel::CliChannel;
 pub use cli_channel::spawn_wtcli_async;
 pub use cli_channel::spawn_wtcli_focus_pane;
+pub use cli_channel::spawn_wtcli_focus_pane_with_callback;
 pub use cli_channel::spawn_wtcli_split_then_focus;
 pub use cli_channel::spawn_wtcli_split_then_focus_with_callback;
+pub use cli_channel::FocusPaneFailureReason;
 
 // Re-export CliChannel as PipeChannel for backward compatibility.
 // All callers that used PipeChannel now get CliChannel (wraps wtcli.exe).

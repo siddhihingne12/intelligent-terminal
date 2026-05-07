@@ -358,6 +358,100 @@ pub struct TabSession {
     pub session_id: Option<String>,
 }
 
+impl TabSession {
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    pub fn clear_recommendations(&mut self) {
+        self.recommendations = None;
+        self.selected_recommendation = 0;
+        self.selected_button = 0;
+        self.rec_scroll = 0;
+    }
+
+    pub fn clear_chat_history(&mut self) {
+        self.messages.clear();
+        self.tool_calls.clear();
+        self.permission = None;
+        self.progress_status = None;
+        self.pending_thought_response.clear();
+        self.activity_frame = 0;
+        self.pending_agent_response.clear();
+        self.agent_streaming = false;
+        self.scroll_offset = 0;
+        self.timing_note = None;
+        self.selection_visible_pending = false;
+        self.current_prompt_text = None;
+        self.current_prompt_submitted_at_unix_s = None;
+        self.pending_completed_turn = None;
+        self.clear_recommendations();
+    }
+
+    pub fn clear_completed_turn_history(&mut self) {
+        self.messages.clear();
+        self.tool_calls.clear();
+        self.permission = None;
+        self.progress_status = None;
+        self.pending_thought_response.clear();
+        self.activity_frame = 0;
+        self.pending_agent_response.clear();
+        self.agent_streaming = false;
+        self.scroll_offset = 0;
+        self.selection_visible_pending = false;
+        self.current_prompt_text = None;
+        self.current_prompt_submitted_at_unix_s = None;
+    }
+
+    pub fn prepare_for_new_prompt(&mut self, prompt_text: &str) {
+        self.clear_chat_history();
+        self.current_prompt_text = Some(prompt_text.to_string());
+        self.prompt_in_flight = true;
+        self.progress_status = Some("Preparing context...".to_string());
+        self.activity_frame = 0;
+    }
+
+    pub fn current_turn_details(&self) -> Vec<ChatMessage> {
+        self.messages
+            .iter()
+            .filter(|message| !matches!(message, ChatMessage::User(_)))
+            .cloned()
+            .collect()
+    }
+
+    pub fn stage_completed_turn(&mut self, agent_text: String) {
+        let Some(prompt) = self.current_prompt_text.clone() else {
+            self.pending_completed_turn = None;
+            return;
+        };
+
+        let mut details = self.current_turn_details();
+        details.push(ChatMessage::Agent(agent_text));
+        self.pending_completed_turn = Some(CompletedTurn { prompt, details });
+    }
+
+    pub fn commit_pending_completed_turn(&mut self) {
+        let Some(turn) = self.pending_completed_turn.take() else {
+            return;
+        };
+
+        self.completed_turns.push(turn);
+        self.focus_latest_completed_turn();
+    }
+
+    pub fn focus_latest_completed_turn(&mut self) {
+        let Some(last) = self.completed_turns.len().checked_sub(1) else {
+            self.selected_history = None;
+            self.expanded_history = None;
+            return;
+        };
+
+        self.selected_history = Some(last);
+        self.expanded_history = None;
+        self.scroll_to_bottom();
+    }
+}
+
 // --- App ---
 
 pub struct App {
@@ -413,6 +507,16 @@ pub struct App {
     // least an entry for the active tab; lazily extended on first
     // `tab_changed` to a new tab.
     tab_sessions: HashMap<String, TabSession>,
+    // The tab from which the currently in-flight prompt was submitted.
+    // ACP-emitted events (chunks, tool calls, AgentMessageEnd, ...) route
+    // to this tab regardless of which tab the user is currently viewing —
+    // otherwise switching tabs mid-stream leaks chunks into the new tab
+    // and leaves the originating tab's `prompt_in_flight` stuck.
+    // Set in the Enter handler before the prompt is sent; cleared once
+    // AgentMessageEnd has been processed. M2's SessionId-based routing
+    // will replace this with a HashMap keyed on SessionId once concurrent
+    // prompts across tabs are allowed.
+    inflight_tab_id: Option<String>,
 }
 
 impl App {
@@ -459,6 +563,7 @@ impl App {
             autofix_generation: 0,
             inflight_autofix_generation: None,
             tab_sessions,
+            inflight_tab_id: None,
         }
     }
 
@@ -494,6 +599,34 @@ impl App {
         self.tab_sessions
             .entry(tab_id.to_string())
             .or_default()
+    }
+
+    /// Tab where the currently in-flight prompt was submitted.
+    /// ACP-emitted events (chunks, tool calls, AgentMessageEnd) must route
+    /// here, not to the active tab, so the user can switch tabs mid-stream
+    /// without breaking the originating tab's prompt lifecycle.
+    /// Falls back to the active tab when no prompt is in flight, which
+    /// makes this safe to call unconditionally from event handlers.
+    pub fn inflight_tab_mut(&mut self) -> &mut TabSession {
+        let key = self
+            .inflight_tab_id
+            .clone()
+            .or_else(|| self.tab_id.clone())
+            .unwrap_or_else(|| DEFAULT_TAB_ID.to_string());
+        self.tab_sessions.entry(key).or_default()
+    }
+
+    /// Read-only counterpart of `inflight_tab_mut`.
+    pub fn inflight_tab(&self) -> &TabSession {
+        let key = self
+            .inflight_tab_id
+            .as_deref()
+            .or(self.tab_id.as_deref())
+            .unwrap_or(DEFAULT_TAB_ID);
+        self.tab_sessions
+            .get(key)
+            .or_else(|| self.tab_sessions.get(DEFAULT_TAB_ID))
+            .expect("active tab session always materialized")
     }
 
     pub async fn run(
@@ -777,8 +910,9 @@ impl App {
                 self.publish_agent_status();
             }
             AppEvent::ProgressStatus(status) => {
-                self.current_tab_mut().progress_status = Some(status);
-                self.scroll_to_bottom();
+                let tab = self.inflight_tab_mut();
+                tab.progress_status = Some(status);
+                tab.scroll_to_bottom();
             }
             AppEvent::AgentConnected {
                 name,
@@ -803,33 +937,39 @@ impl App {
             AppEvent::AgentError(msg) => {
                 self.state = ConnectionState::Failed(msg.clone());
                 self.publish_agent_status();
-                self.current_tab_mut().prompt_in_flight = false;
-                self.current_tab_mut().agent_streaming = false;
-                self.current_tab_mut().progress_status = None;
-                self.current_tab_mut().pending_thought_response.clear();
-                self.current_tab_mut().activity_frame = 0;
-                self.current_tab_mut().pending_agent_response.clear();
-                self.current_tab_mut().timing_note = None;
-                self.current_tab_mut().pending_completed_turn = None;
-                self.current_tab_mut().messages.push(ChatMessage::Error(msg));
+                {
+                    let tab = self.inflight_tab_mut();
+                    tab.prompt_in_flight = false;
+                    tab.agent_streaming = false;
+                    tab.progress_status = None;
+                    tab.pending_thought_response.clear();
+                    tab.activity_frame = 0;
+                    tab.pending_agent_response.clear();
+                    tab.timing_note = None;
+                    tab.pending_completed_turn = None;
+                    tab.messages.push(ChatMessage::Error(msg));
+                }
+                self.inflight_tab_id = None;
             }
             AppEvent::ExecutionInfo(message) => {
                 self.push_execution_info(message);
-                self.scroll_to_bottom();
+                self.inflight_tab_mut().scroll_to_bottom();
             }
             AppEvent::AgentThoughtChunk(text) => {
-                self.current_tab_mut().prompt_in_flight = true;
-                if self.current_tab_mut().progress_status.is_none() {
-                    self.current_tab_mut().progress_status = Some("Thinking...".to_string());
+                let tab = self.inflight_tab_mut();
+                tab.prompt_in_flight = true;
+                if tab.progress_status.is_none() {
+                    tab.progress_status = Some("Thinking...".to_string());
                 }
-                append_thought_preview(&mut self.current_tab_mut().pending_thought_response, &text);
+                append_thought_preview(&mut tab.pending_thought_response, &text);
             }
             AppEvent::AgentMessageChunk(text) => {
-                self.current_tab_mut().agent_streaming = true;
-                self.current_tab_mut().prompt_in_flight = true;
-                self.current_tab_mut().progress_status = None;
-                self.current_tab_mut().pending_thought_response.clear();
-                self.current_tab_mut().pending_agent_response.push_str(&text);
+                let tab = self.inflight_tab_mut();
+                tab.agent_streaming = true;
+                tab.prompt_in_flight = true;
+                tab.progress_status = None;
+                tab.pending_thought_response.clear();
+                tab.pending_agent_response.push_str(&text);
             }
             AppEvent::AgentMessageEnd => {
                 // Check if this response is stale (generation bumped since we sent).
@@ -841,54 +981,64 @@ impl App {
                 if is_stale_autofix {
                     // Discard: a newer error or cancel superseded this response.
                     tracing::info!(target: "autofix", inflight_gen = ?self.inflight_autofix_generation, current_gen = self.autofix_generation, "discarding stale autofix response");
-                    self.current_tab_mut().agent_streaming = false;
-                    self.current_tab_mut().prompt_in_flight = false;
-                    self.current_tab_mut().progress_status = None;
-                    self.current_tab_mut().pending_thought_response.clear();
-                    self.current_tab_mut().pending_agent_response.clear();
-                    self.current_tab_mut().activity_frame = 0;
+                    {
+                        let tab = self.inflight_tab_mut();
+                        tab.agent_streaming = false;
+                        tab.prompt_in_flight = false;
+                        tab.progress_status = None;
+                        tab.pending_thought_response.clear();
+                        tab.pending_agent_response.clear();
+                        tab.activity_frame = 0;
+                    }
                     self.inflight_autofix_generation = None;
+                    self.inflight_tab_id = None;
                     return;
                 }
 
                 // Always reset streaming flags so autofix guards don't get stuck.
-                self.current_tab_mut().agent_streaming = false;
-                self.current_tab_mut().prompt_in_flight = false;
-                self.current_tab_mut().progress_status = None;
-                self.current_tab_mut().pending_thought_response.clear();
-                self.current_tab_mut().activity_frame = 0;
+                {
+                    let tab = self.inflight_tab_mut();
+                    tab.agent_streaming = false;
+                    tab.prompt_in_flight = false;
+                    tab.progress_status = None;
+                    tab.pending_thought_response.clear();
+                    tab.activity_frame = 0;
+                }
                 self.inflight_autofix_generation = None;
 
-                {
-                    if let Some(summary) = self.completion_latency_summary() {
-                        self.push_execution_info(summary);
+                if let Some(summary) = self.completion_latency_summary() {
+                    self.push_execution_info(summary);
+                }
+                match self.finalize_agent_response() {
+                    FinalizeOutcome::SelectionReady => {
+                        self.inflight_tab_mut().clear_completed_turn_history();
                     }
-                    match self.finalize_agent_response() {
-                        FinalizeOutcome::SelectionReady => {
-                            self.clear_completed_turn_history();
-                        }
-                        FinalizeOutcome::None => {
-                            self.scroll_to_bottom();
-                        }
+                    FinalizeOutcome::None => {
+                        self.inflight_tab_mut().scroll_to_bottom();
                     }
                 }
+                // Prompt is fully done — release the routing pin so the next
+                // submission can target whichever tab the user is on then.
+                self.inflight_tab_id = None;
             }
             AppEvent::TimingMetric(note) => {
-                self.current_tab_mut().timing_note = Some(note);
+                self.inflight_tab_mut().timing_note = Some(note);
             }
             AppEvent::ToolCall { id, title, status } => {
-                self.current_tab_mut().tool_calls
+                let tab = self.inflight_tab_mut();
+                tab.tool_calls
                     .insert(id.clone(), (title.clone(), status.clone()));
-                self.current_tab_mut().messages
+                tab.messages
                     .push(ChatMessage::ToolCall { id, title, status });
-                self.scroll_to_bottom();
+                tab.scroll_to_bottom();
             }
             AppEvent::ToolCallUpdate { id, status } => {
-                if let Some(entry) = self.current_tab_mut().tool_calls.get_mut(&id) {
+                let tab = self.inflight_tab_mut();
+                if let Some(entry) = tab.tool_calls.get_mut(&id) {
                     entry.1 = status.clone();
                 }
                 // Update in-place in messages
-                for msg in &mut self.current_tab_mut().messages {
+                for msg in &mut tab.messages {
                     if let ChatMessage::ToolCall {
                         id: ref mid,
                         status: ref mut s,
@@ -902,15 +1052,16 @@ impl App {
                 }
             }
             AppEvent::Plan(entries) => {
-                self.current_tab_mut().messages.push(ChatMessage::Plan(entries));
-                self.scroll_to_bottom();
+                let tab = self.inflight_tab_mut();
+                tab.messages.push(ChatMessage::Plan(entries));
+                tab.scroll_to_bottom();
             }
             AppEvent::PermissionRequest {
                 description,
                 options,
                 responder,
             } => {
-                self.current_tab_mut().permission = Some(PermissionState {
+                self.inflight_tab_mut().permission = Some(PermissionState {
                     description,
                     options,
                     selected: 0,
@@ -1272,7 +1423,7 @@ impl App {
                             }
                         }
                         let armed_pane = self.autofix_pane_id.take();
-                        self.commit_pending_completed_turn();
+                        self.current_tab_mut().commit_pending_completed_turn();
                         self.clear_recommendations();
                         let label = if insert_only { "Inserting" } else { "Executing" };
                         self.push_execution_info(format!("{} choice {}.", label, choice.choice));
@@ -1291,9 +1442,13 @@ impl App {
                     let text = self.input.clone();
                     self.input.clear();
                     self.cursor_pos = 0;
-                    self.prepare_for_new_prompt(&text);
-                    self.current_tab_mut().messages.push(ChatMessage::User(text.clone()));
-                    self.scroll_to_bottom();
+                    // Pin the originating tab so chunks/end events route here
+                    // even if the user switches tabs while the prompt is in flight.
+                    self.inflight_tab_id = Some(self.active_tab_key().to_string());
+                    let tab = self.current_tab_mut();
+                    tab.prepare_for_new_prompt(&text);
+                    tab.messages.push(ChatMessage::User(text.clone()));
+                    tab.scroll_to_bottom();
                     let pane_context = PaneContext {
                         pane_id: self.pane_id.clone(),
                         tab_id: self.tab_id.clone(),
@@ -1302,9 +1457,10 @@ impl App {
                         source_pane_id: None,
                     };
                     let prompt = PromptSubmission::new(text, Some(pane_context));
-                    self.current_tab_mut().current_prompt_id = Some(prompt.id);
-                    self.current_tab_mut().current_prompt_submitted_at_unix_s = Some(prompt.submitted_at_unix_s);
-                    self.current_tab_mut().selection_visible_pending = false;
+                    let tab = self.current_tab_mut();
+                    tab.current_prompt_id = Some(prompt.id);
+                    tab.current_prompt_submitted_at_unix_s = Some(prompt.submitted_at_unix_s);
+                    tab.selection_visible_pending = false;
                     prompt_timing_log(
                         prompt.id,
                         prompt.submitted_at_unix_s,
@@ -1352,7 +1508,7 @@ impl App {
     }
 
     fn scroll_to_bottom(&mut self) {
-        self.current_tab_mut().scroll_offset = 0;
+        self.current_tab_mut().scroll_to_bottom();
     }
 
     fn has_activity_indicator(&self) -> bool {
@@ -1460,10 +1616,7 @@ impl App {
     }
 
     fn clear_recommendations(&mut self) {
-        self.current_tab_mut().recommendations = None;
-        self.current_tab_mut().selected_recommendation = 0;
-        self.current_tab_mut().selected_button = 0;
-        self.current_tab_mut().rec_scroll = 0;
+        self.current_tab_mut().clear_recommendations();
     }
 
     /// Adjusts rec_scroll so the selected recommendation card's title is at the top of the panel.
@@ -1530,40 +1683,11 @@ impl App {
     }
 
     fn clear_chat_history(&mut self) {
-        {
-            let tab = self.current_tab_mut();
-            tab.messages.clear();
-            tab.tool_calls.clear();
-            tab.permission = None;
-            tab.progress_status = None;
-            tab.pending_thought_response.clear();
-            tab.activity_frame = 0;
-            tab.pending_agent_response.clear();
-            tab.agent_streaming = false;
-            tab.scroll_offset = 0;
-            tab.timing_note = None;
-            tab.selection_visible_pending = false;
-            tab.current_prompt_text = None;
-            tab.current_prompt_submitted_at_unix_s = None;
-            tab.pending_completed_turn = None;
-        }
-        self.clear_recommendations();
+        self.current_tab_mut().clear_chat_history();
     }
 
     fn clear_completed_turn_history(&mut self) {
-        let tab = self.current_tab_mut();
-        tab.messages.clear();
-        tab.tool_calls.clear();
-        tab.permission = None;
-        tab.progress_status = None;
-        tab.pending_thought_response.clear();
-        tab.activity_frame = 0;
-        tab.pending_agent_response.clear();
-        tab.agent_streaming = false;
-        tab.scroll_offset = 0;
-        tab.selection_visible_pending = false;
-        tab.current_prompt_text = None;
-        tab.current_prompt_submitted_at_unix_s = None;
+        self.current_tab_mut().clear_completed_turn_history();
     }
 
     fn completion_latency_summary(&self) -> Option<String> {
@@ -1762,7 +1886,7 @@ impl App {
             }
         }
         self.autofix_pane_id = None;
-        self.commit_pending_completed_turn();
+        self.current_tab_mut().commit_pending_completed_turn();
         self.clear_recommendations();
         self.push_execution_info(format!("Auto-executing choice {}.", choice.choice));
         let _ = self
@@ -1806,55 +1930,7 @@ impl App {
         armed_fix_preview(rec)
     }
 
-    fn prepare_for_new_prompt(&mut self, prompt_text: &str) {
-        self.clear_chat_history();
-        self.current_tab_mut().current_prompt_text = Some(prompt_text.to_string());
-        self.current_tab_mut().prompt_in_flight = true;
-        self.current_tab_mut().progress_status = Some("Preparing context...".to_string());
-        self.current_tab_mut().activity_frame = 0;
-    }
-
     fn push_execution_info(&mut self, _message: String) {}
-
-    fn current_turn_details(&self) -> Vec<ChatMessage> {
-        self.current_tab().messages
-            .iter()
-            .filter(|message| !matches!(message, ChatMessage::User(_)))
-            .cloned()
-            .collect()
-    }
-
-    fn stage_completed_turn(&mut self, agent_text: String) {
-        let Some(prompt) = self.current_tab_mut().current_prompt_text.clone() else {
-            self.current_tab_mut().pending_completed_turn = None;
-            return;
-        };
-
-        let mut details = self.current_turn_details();
-        details.push(ChatMessage::Agent(agent_text));
-        self.current_tab_mut().pending_completed_turn = Some(CompletedTurn { prompt, details });
-    }
-
-    fn commit_pending_completed_turn(&mut self) {
-        let Some(turn) = self.current_tab_mut().pending_completed_turn.take() else {
-            return;
-        };
-
-        self.current_tab_mut().completed_turns.push(turn);
-        self.focus_latest_completed_turn();
-    }
-
-    fn focus_latest_completed_turn(&mut self) {
-        let Some(last) = self.current_tab_mut().completed_turns.len().checked_sub(1) else {
-            self.current_tab_mut().selected_history = None;
-            self.current_tab_mut().expanded_history = None;
-            return;
-        };
-
-        self.current_tab_mut().selected_history = Some(last);
-        self.current_tab_mut().expanded_history = None;
-        self.scroll_to_bottom();
-    }
 
     fn select_previous_history_turn(&mut self) {
         let Some(selected) = self.current_tab_mut().selected_history else {
@@ -1924,12 +2000,12 @@ impl App {
     }
 
     fn finalize_agent_response(&mut self) -> FinalizeOutcome {
-        if self.current_tab_mut().pending_agent_response.trim().is_empty() {
+        if self.inflight_tab().pending_agent_response.trim().is_empty() {
             self.log_selection_phase("selection_parse_failed", "reason=empty_agent_response");
             return FinalizeOutcome::None;
         }
 
-        let text = std::mem::take(&mut self.current_tab_mut().pending_agent_response);
+        let text = std::mem::take(&mut self.inflight_tab_mut().pending_agent_response);
 
         // Autofix responses use a minimal prompt/format; parse them separately.
         if self.autofix_pane_id.is_some() {
@@ -1943,40 +2019,49 @@ impl App {
             )
         }) {
             Ok(recommendations) => {
-                self.stage_completed_turn(text);
-                self.current_tab_mut().selected_recommendation = recommended_choice_index(&recommendations);
+                let rec_idx = recommended_choice_index(&recommendations);
+                let choice_count = recommendations.choices.len();
+                let recommended_choice = recommendations.recommended_choice;
+                let tab = self.inflight_tab_mut();
+                tab.stage_completed_turn(text);
+                tab.selected_recommendation = rec_idx;
+                tab.recommendations = Some(recommendations);
+                tab.selection_visible_pending = true;
                 self.log_selection_phase(
                     "selection_ready",
                     &format!(
                         "choice_count={} recommended_choice={:?}",
-                        recommendations.choices.len(),
-                        recommendations.recommended_choice
+                        choice_count, recommended_choice
                     ),
                 );
-                self.current_tab_mut().recommendations = Some(recommendations);
-                self.current_tab_mut().selection_visible_pending = true;
                 FinalizeOutcome::SelectionReady
             }
             Err(err) => {
-                self.clear_recommendations();
-                self.current_tab_mut().pending_completed_turn = None;
                 let error_text = format!("{:#}", err).replace('\n', " | ");
+                let chars = text.chars().count();
+                let has_prompt = self.inflight_tab().current_prompt_text.is_some();
+                {
+                    let tab = self.inflight_tab_mut();
+                    tab.clear_recommendations();
+                    tab.pending_completed_turn = None;
+                }
                 self.log_selection_phase(
                     "selection_parse_failed",
                     &format!(
                         "response_chars={} error={:?}",
-                        text.chars().count(),
-                        error_text
+                        chars, error_text
                     ),
                 );
-                if self.current_tab_mut().current_prompt_text.is_some() {
-                    self.stage_completed_turn(text);
-                    self.commit_pending_completed_turn();
-                    self.clear_chat_history();
+                if has_prompt {
+                    let tab = self.inflight_tab_mut();
+                    tab.stage_completed_turn(text);
+                    tab.commit_pending_completed_turn();
+                    tab.clear_chat_history();
                 } else {
-                    self.current_tab_mut().prompt_in_flight = false;
-                    self.current_tab_mut().progress_status = None;
-                    self.current_tab_mut().agent_streaming = false;
+                    let tab = self.inflight_tab_mut();
+                    tab.prompt_in_flight = false;
+                    tab.progress_status = None;
+                    tab.agent_streaming = false;
                 }
                 FinalizeOutcome::None
             }
@@ -1997,9 +2082,11 @@ impl App {
                 );
                 let preview = Self::armed_fix_preview(&recommendations);
                 self.emit_autofix_state_armed(&pane_id, &preview);
-                self.current_tab_mut().selected_recommendation = recommended_choice_index(&recommendations);
-                self.current_tab_mut().recommendations = Some(recommendations);
-                self.current_tab_mut().selection_visible_pending = true;
+                let rec_idx = recommended_choice_index(&recommendations);
+                let tab = self.inflight_tab_mut();
+                tab.selected_recommendation = rec_idx;
+                tab.recommendations = Some(recommendations);
+                tab.selection_visible_pending = true;
                 FinalizeOutcome::SelectionReady
             }
             AutofixDecision::Explain { title, explanation } => {
@@ -2015,17 +2102,18 @@ impl App {
                 // pane reveals it. The autofix prompt is internal so we use a
                 // human-readable label as the turn's "prompt" line.
                 let turn_prompt = format!("Auto-diagnosed error in pane {pane_id}");
-                let mut details = self.current_turn_details();
+                let tab = self.inflight_tab_mut();
+                let mut details = tab.current_turn_details();
                 details.push(ChatMessage::Agent(explanation));
-                self.current_tab_mut().pending_completed_turn = Some(CompletedTurn {
+                tab.pending_completed_turn = Some(CompletedTurn {
                     prompt: turn_prompt,
                     details,
                 });
-                self.commit_pending_completed_turn();
+                tab.commit_pending_completed_turn();
                 // Auto-expand: the diagnosis is the whole point of this turn,
                 // and the user shouldn't have to guess that the prompt header
                 // is collapsible to reveal it.
-                self.current_tab_mut().expanded_history = self.current_tab_mut().selected_history;
+                tab.expanded_history = tab.selected_history;
 
                 self.emit_autofix_state_suggested(&pane_id, &title);
 
@@ -2034,27 +2122,31 @@ impl App {
                 // bottom bar indicator.
                 self.suggested_pane_id = Some(pane_id.clone());
                 self.autofix_pane_id = None;
-                self.clear_recommendations();
-                self.current_tab_mut().prompt_in_flight = false;
-                self.current_tab_mut().progress_status = None;
-                self.current_tab_mut().agent_streaming = false;
+                let tab = self.inflight_tab_mut();
+                tab.clear_recommendations();
+                tab.prompt_in_flight = false;
+                tab.progress_status = None;
+                tab.agent_streaming = false;
                 FinalizeOutcome::None
             }
             AutofixDecision::Ignore => {
                 self.log_selection_phase("autofix_ignore", &format!("pane={pane_id}"));
                 self.autofix_pane_id = None;
-                self.clear_recommendations();
                 self.emit_autofix_state_cleared(&pane_id);
-                self.current_tab_mut().prompt_in_flight = false;
-                self.current_tab_mut().progress_status = None;
-                self.current_tab_mut().agent_streaming = false;
+                let tab = self.inflight_tab_mut();
+                tab.clear_recommendations();
+                tab.prompt_in_flight = false;
+                tab.progress_status = None;
+                tab.agent_streaming = false;
                 FinalizeOutcome::None
             }
         }
     }
 
     fn log_selection_phase(&self, phase: &str, details: &str) {
-        let tab = self.current_tab();
+        // log against the in-flight tab so traces stay coherent with where
+        // the prompt was submitted, even after the user switches tabs.
+        let tab = self.inflight_tab();
         if let (Some(prompt_id), Some(submitted_at_unix_s)) =
             (tab.current_prompt_id, tab.current_prompt_submitted_at_unix_s)
         {

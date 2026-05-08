@@ -278,7 +278,7 @@ pub fn route_agent_event_to_registry(
             key,
             reason: payload.get("reason").and_then(|v| v.as_str()).unwrap_or("").to_string(),
         },
-        // Agent-side error (e.g., API/network failure surfaced by ErrorOccurred
+        // Agent-side error (e.g., API/network failure surfaced by StopFailure
         // hook). Reuses ConnectionFailed since both flow into the same
         // status=Error + last_error=<reason> handling at the registry level.
         "agent.error" => SessionEvent::ConnectionFailed {
@@ -4905,7 +4905,7 @@ mod tests {
 
     #[test]
     fn route_agent_event_error_transitions_to_error_state() {
-        // ErrorOccurred hook fires `agent.error`. The registry must surface this
+        // StopFailure hook fires `agent.error`. The registry must surface this
         // as status=Error with the reason captured in last_error.
         use crate::agent_sessions::{AgentSessionRegistry, AgentStatus};
         let mut reg = AgentSessionRegistry::new();

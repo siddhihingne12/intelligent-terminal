@@ -21,6 +21,7 @@
 #include "App.h"
 #include "DebugTapConnection.h"
 #include "AgentPaneContent.h"
+#include "FreOverlay.h"
 #include "MarkdownPaneContent.h"
 #include "Remoting.h"
 #include "ScratchpadContent.h"
@@ -839,6 +840,44 @@ namespace winrt::TerminalApp::implementation
         return SplitDirection::Right;
     }
 
+    // ── First-run experience ──────────────────────────────────────────────
+
+    bool TerminalPage::_IsFreRequired() const
+    {
+        return !ApplicationState::SharedInstance().AgentFreCompleted();
+    }
+
+    void TerminalPage::_ShowFreOverlay()
+    {
+        if (auto overlay = FindName(L"FreOverlayElement").try_as<winrt::TerminalApp::FreOverlay>())
+        {
+            overlay.Completed({ get_weak(), &TerminalPage::_OnFreCompleted });
+            overlay.Visibility(Visibility::Visible);
+        }
+    }
+
+    void TerminalPage::_OnFreCompleted(const winrt::TerminalApp::FreOverlay& /*sender*/,
+                                       const winrt::Windows::Foundation::IInspectable& /*args*/)
+    {
+        // Hide the overlay
+        if (auto overlay = FreOverlayElement())
+        {
+            overlay.Visibility(Visibility::Collapsed);
+        }
+
+        // Persist: never show FRE again
+        ApplicationState::SharedInstance().AgentFreCompleted(true);
+
+        // Now that FRE is done, kick off agent pane pre-warming.
+        if (!_agentPane.lock())
+        {
+            if (const auto tab = _GetFocusedTabImpl())
+            {
+                _AutoCreateHiddenAgentPane(tab);
+            }
+        }
+    }
+
     // Repositions the agent pane to match the current AgentPanePosition setting.
     void TerminalPage::_RepositionAgentPanes()
     {
@@ -1117,6 +1156,15 @@ namespace winrt::TerminalApp::implementation
     // and autofix work in the background as long as the pane hasn't been closed.
     void TerminalPage::_AutoCreateHiddenAgentPane(winrt::com_ptr<Tab> tab)
     {
+        // FRE not completed — don't pre-warm the agent pane.
+        // The user hasn't seen the welcome screen yet; we'll create
+        // the pane after they dismiss the FRE overlay.
+        if (_IsFreRequired())
+        {
+            _agentPaneLog("_AutoCreateHiddenAgentPane: FRE not completed, skipping");
+            return;
+        }
+
         // Already have a live pane — nothing to do.
         if (_agentPane.lock())
         {
@@ -2074,6 +2122,13 @@ namespace winrt::TerminalApp::implementation
             // initialization is finished. However, there are still a few frames
             // after the frame is displayed before the XAML content first draws,
             // so that didn't actually resolve any issues.
+            // Show the first-run experience overlay on the very first launch.
+            // This covers the terminal content until the user clicks Next.
+            if (_IsFreRequired())
+            {
+                _ShowFreOverlay();
+            }
+
             Dispatcher().RunAsync(CoreDispatcherPriority::Low, [weak = get_weak()]() {
                 if (auto self{ weak.get() })
                 {

@@ -1519,6 +1519,16 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        tracing::info!(
+            target: "input",
+            code = ?key.code,
+            modifiers = ?key.modifiers,
+            input_empty = self.current_tab().input.is_empty(),
+            recs = self.current_tab().recommendations.is_some(),
+            turns = self.current_tab().completed_turns.len(),
+            selected_turn = ?self.current_tab().selected_completed_turn_idx,
+            "key received"
+        );
         // If permission modal is showing, route keys there
         if let Some(ref mut perm) = self.current_tab_mut().permission {
             match key.code {

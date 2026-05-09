@@ -1723,6 +1723,11 @@ async fn run_acp_app(
             });
             app_state.set_install_request_tx(install_req_tx);
 
+            // Wire the agent_event channel so dispatch_resume's split-pane
+            // background callback can post AgentSessionEvent (specifically
+            // ResumePaneAssigned) back into the event loop.
+            app_state.set_agent_event_tx(event_tx.clone());
+
             // ── seed Agents view from on-disk history ─────────────────────
             // history_loader scans Claude/Copilot/Gemini per-CLI session
             // dirs and returns historical AgentSession rows. merge_historical

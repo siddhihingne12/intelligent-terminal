@@ -90,9 +90,6 @@ TerminalProtocolComServer : winrt::implements<TerminalProtocolComServer, Protoco
                             winrt::hstring const& name,
                             winrt::hstring const& value);
     winrt::hstring SetSettings(winrt::hstring const& settingsContent);
-    winrt::Windows::Foundation::IAsyncOperation<Protocol::QuickPickResult> QuickPick(winrt::hstring const& title,
-                                         winrt::array_view<winrt::hstring const> choices,
-                                         bool allowFreeInput);
 
     // Events — push-based via callback
     void Subscribe(Protocol::IProtocolEventCallback const& callback);

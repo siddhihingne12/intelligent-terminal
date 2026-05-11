@@ -571,22 +571,6 @@ impl WtChannel for CliChannel {
             // PipeChannel attached via inherited handles — only the wta
             // processes WT itself launches can satisfy it.
             "get_capabilities" => self.run_wtcli(&["info"]).await,
-            "quick_pick" => {
-                let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                let title_owned = title.to_string();
-                let mut args = vec!["quick-pick"];
-                if !title_owned.is_empty() {
-                    args.extend(["--title", &title_owned]);
-                }
-                if let Some(choices) = params.get("choices").and_then(|v| v.as_array()) {
-                    for c in choices {
-                        if let Some(s) = c.as_str() {
-                            args.push(s);
-                        }
-                    }
-                }
-                self.run_wtcli(&args).await
-            }
             other => bail!("Unsupported method: {}", other),
         }
     }

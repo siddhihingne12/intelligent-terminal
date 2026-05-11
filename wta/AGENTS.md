@@ -103,7 +103,7 @@ Most WT operations flow through `wtcli.exe` to WT's out-of-process COM server.
 - WT-side server: `src/cascadia/WindowsTerminal/TerminalProtocolComServer.cpp`
 - Discovery: `WT_COM_CLSID`, injected into panes by WT
 
-The COM surface currently exposes reads and several mutations, including `list_*`, `read_pane_output`, `create_tab`, `split_pane`, `close_pane`, `focus_pane`, `quick_pick`, and event subscribe/publish. It does **not** expose direct shell input.
+The COM surface currently exposes reads and several mutations, including `list_*`, `read_pane_output`, `create_tab`, `split_pane`, `close_pane`, `focus_pane`, and event subscribe/publish. It does **not** expose direct shell input.
 
 ### Per-WTA Inherited Pipe
 
@@ -166,9 +166,8 @@ Agents that can shell out, and humans debugging WTA, can use WTA as a small WT h
 | `wait-for` | -- | delegated to `wtcli wait-for` |
 | `pane-status` | -- | `get_process_status` |
 | `listen` | `mon` | COM event subscribe |
-| `quick-pick` | -- | `quick_pick` |
 
-`send-keys` is intentionally not supported. Direct shell input must flow through a WT-launched WTA process that owns the inherited `WT_PROTOCOL_PIPE_R/W` handles.
+`send-keys` is intentionally not supported.Direct shell input must flow through a WT-launched WTA process that owns the inherited `WT_PROTOCOL_PIPE_R/W` handles.
 
 ## Connection Discovery
 

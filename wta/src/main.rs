@@ -258,21 +258,6 @@ enum Command {
         cwd: Option<String>,
     },
 
-    /// Show a quick-pick dialog in Windows Terminal and print the user's selection
-    QuickPick {
-        /// Choices to present (1 or more, all positional args)
-        #[arg(required = true)]
-        choices: Vec<String>,
-
-        /// Title/question shown above the choices
-        #[arg(long, default_value = "Select an option")]
-        title: String,
-
-        /// Allow freeform text input in addition to choices
-        #[arg(long)]
-        free_input: bool,
-    },
-
     /// Manage the wt-agent-hooks bridge for supported CLI agents
     /// (Copilot / Claude / Gemini). See `agent_hooks_installer` for
     /// what each action does.
@@ -551,35 +536,6 @@ async fn main() -> Result<()> {
             cwd,
         }) => {
             run_delegate(&pipe_override, &prompt, &agent, delegate_agent.as_deref(), delegate_model.as_deref(), cwd.as_deref()).await
-        }
-
-        // ── Quick pick ──
-        Some(Command::QuickPick {
-            title,
-            choices,
-            free_input,
-        }) => {
-            let channel = connect_channel(&pipe_override).await?;
-            let choices_json: Vec<serde_json::Value> =
-                choices.iter().map(|c| serde_json::Value::String(c.clone())).collect();
-            let result = channel
-                .request(
-                    "quick_pick",
-                    json!({
-                        "title": title,
-                        "choices": choices_json,
-                        "allow_free_input": free_input,
-                    }),
-                )
-                .await?;
-            let cancelled = result.get("cancelled").and_then(|v| v.as_bool()).unwrap_or(false);
-            if cancelled {
-                std::process::exit(1);
-            }
-            if let Some(selected) = result.get("selected").and_then(|v| v.as_str()) {
-                println!("{}", selected);
-            }
-            Ok(())
         }
 
         // ── Listen for events ──

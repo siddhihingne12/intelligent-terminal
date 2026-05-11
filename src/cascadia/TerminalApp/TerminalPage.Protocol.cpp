@@ -16,7 +16,6 @@
 #include "../../types/inc/utils.hpp"
 #include "../TerminalSettingsAppAdapterLib/TerminalSettings.h"
 
-#include <json/json.h>
 #include <wil/resource.h>
 
 using namespace winrt;
@@ -30,13 +29,6 @@ namespace Protocol = winrt::Microsoft::Terminal::Protocol;
 
 namespace winrt::TerminalApp::implementation
 {
-    // Cross-thread state for ShowProtocolQuickPick.
-    struct QuickPickState
-    {
-        wil::unique_event completedEvent;
-        winrt::hstring result;
-    };
-
     // Helper to get PID from a pane's terminal control connection.
     static uint32_t _getPidFromPane(const std::shared_ptr<Pane>& pane)
     {
@@ -744,114 +736,6 @@ namespace winrt::TerminalApp::implementation
         }
 
         co_return false;
-    }
-
-    // ============================================================================
-    // QuickPick — still uses JSON for the choices parameter (UI-facing, not IPC)
-    // ============================================================================
-
-    IAsyncOperation<hstring> TerminalPage::ShowProtocolQuickPick(hstring /*title*/, hstring choicesJson, bool /*allowFreeInput*/)
-    {
-        auto strong = get_strong();
-
-        // Reentry guard — only one quick-pick can be active at a time.
-        bool expected = false;
-        if (!_quickPickInProgress.compare_exchange_strong(expected, true))
-        {
-            co_return winrt::to_hstring("{\"cancelled\":true,\"selected\":\"\"}");
-        }
-        auto guard = wil::scope_exit([this]() { _quickPickInProgress.store(false); });
-
-        // Parse choices on the calling thread — no UI needed.
-        Json::Value choices;
-        {
-            Json::CharReaderBuilder rb;
-            std::string errors;
-            auto choicesStr = winrt::to_string(choicesJson);
-            std::istringstream stream(choicesStr);
-            if (!Json::parseFromStream(rb, stream, &choices, &errors) || !choices.isArray())
-            {
-                co_return L"";
-            }
-        }
-
-        // Shared state for bridging UI event callbacks to this coroutine.
-        auto state = std::make_shared<QuickPickState>();
-        state->completedEvent.create(wil::EventOptions::ManualReset);
-
-        auto weakThis = get_weak();
-        co_await wil::resume_foreground(Dispatcher());
-
-        // Build Command objects for each choice (name only, no action needed).
-        auto commands = winrt::single_threaded_vector<Command>();
-        for (Json::ArrayIndex i = 0; i < choices.size(); ++i)
-        {
-            auto choiceText = winrt::to_hstring(choices[i].asString());
-            auto cmd = Command{};
-            cmd.Name(choiceText);
-            commands.Append(cmd);
-        }
-
-        auto palette = LoadCommandPalette();
-        palette.SetQuickPickCommands(commands);
-
-        // Subscribe to QuickPickCompleted for the selection path.
-        // The event fires BEFORE _close() in _dispatchQuickPick,
-        // so we can set the result and signal the I/O thread directly.
-        auto qpToken = std::make_shared<winrt::event_token>();
-        *qpToken = palette.QuickPickCompleted(
-            [state, weakThis, qpToken](auto&&, const winrt::hstring& selectedName) {
-                // Build properly-escaped JSON result.
-                Json::Value result;
-                result["cancelled"] = false;
-                result["selected"] = winrt::to_string(selectedName);
-                Json::StreamWriterBuilder wb;
-                wb["indentation"] = "";
-                state->result = winrt::to_hstring(Json::writeString(wb, result));
-                SetEvent(state->completedEvent.get());
-            });
-
-        // Visibility callback handles cancellation (Escape / click-away)
-        // and cleanup (unregister event handlers, restore action map).
-        auto visToken = std::make_shared<int64_t>(0);
-        *visToken = palette.RegisterPropertyChangedCallback(
-            winrt::Windows::UI::Xaml::UIElement::VisibilityProperty(),
-            [state, weakThis, visToken, qpToken](
-                winrt::Windows::UI::Xaml::DependencyObject const& sender,
-                winrt::Windows::UI::Xaml::DependencyProperty const&) {
-                auto vis = winrt::unbox_value<winrt::Windows::UI::Xaml::Visibility>(
-                    sender.GetValue(winrt::Windows::UI::Xaml::UIElement::VisibilityProperty()));
-
-                if (vis != winrt::Windows::UI::Xaml::Visibility::Collapsed)
-                {
-                    return;
-                }
-
-                // Unregister both callbacks immediately.
-                sender.UnregisterPropertyChangedCallback(
-                    winrt::Windows::UI::Xaml::UIElement::VisibilityProperty(), *visToken);
-
-                if (auto page = weakThis.get())
-                {
-                    auto palette2 = page->LoadCommandPalette();
-                    palette2.QuickPickCompleted(*qpToken);
-                    palette2.SetActionMap(page->_settings.ActionMap());
-                }
-
-                // If result is still empty, the user cancelled (Escape / click-away).
-                if (state->result.empty())
-                {
-                    state->result = winrt::to_hstring("{\"cancelled\":true,\"selected\":\"\"}");
-                    SetEvent(state->completedEvent.get());
-                }
-            });
-
-        palette.Visibility(winrt::Windows::UI::Xaml::Visibility::Visible);
-
-        // Asynchronously wait — UI thread is FREE during this wait.
-        co_await winrt::resume_on_signal(state->completedEvent.get());
-
-        co_return state->result;
     }
 
 }

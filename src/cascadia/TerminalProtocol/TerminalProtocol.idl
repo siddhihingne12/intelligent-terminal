@@ -84,12 +84,6 @@ namespace Microsoft.Terminal.Protocol
         String ProtocolVersion;
     };
 
-    struct QuickPickResult
-    {
-        Boolean Cancelled;
-        String Selected;
-    };
-
     // Callback interface — implemented by clients (e.g. wtcli) to receive
     // push-based event notifications from Terminal.
     interface IProtocolEventCallback
@@ -127,9 +121,6 @@ namespace Microsoft.Terminal.Protocol
         void FocusPane(Guid sessionId);
         void SetSessionVariable(Guid sessionId, String name, String value);
         String SetSettings(String settingsContent);
-
-        // Interactive
-        Windows.Foundation.IAsyncOperation<QuickPickResult> QuickPick(String title, String[] choices, Boolean allowFreeInput);
 
         // Events — push-based via callback
         void Subscribe(IProtocolEventCallback callback);

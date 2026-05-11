@@ -38,9 +38,7 @@ try
 
     // Register the COM class factory on a dedicated MTA thread so that
     // incoming COM calls are dispatched to MTA worker threads rather than
-    // the STA/UI thread.  This is critical for methods that block
-    // (QuickPick waits for user input) — dispatching those on the UI
-    // thread would deadlock or freeze the app.
+    // the STA/UI thread. This keeps long-running calls off the UI thread.
     g_comMtaStop.create(wil::EventOptions::ManualReset);
 
     wil::unique_event ready(wil::EventOptions::ManualReset);
@@ -307,7 +305,6 @@ winrt::hstring TerminalProtocolComServer::GetCapabilities()
         "close_pane",
         "set_session_variable",
         "set_settings",
-        "quick_pick",
         "subscribe",
         "unsubscribe",
         "send_event",
@@ -686,46 +683,6 @@ winrt::hstring TerminalProtocolComServer::SetSettings(
     til::io::write_utf8_string_to_file_atomic(settingsPath, contentStr);
 
     return winrt::hstring{ backup.wstring() };
-}
-
-// ============================================================================
-// Interactive
-// ============================================================================
-
-winrt::Windows::Foundation::IAsyncOperation<Protocol::QuickPickResult> TerminalProtocolComServer::QuickPick(
-    winrt::hstring const& title,
-    winrt::array_view<winrt::hstring const> choices,
-    bool allowFreeInput)
-{
-    THROW_HR_IF(E_NOT_VALID_STATE, !s_emperor);
-
-    // Serialize choices to JSON before any co_await (array_view is non-owning).
-    Json::Value choicesArr(Json::arrayValue);
-    for (const auto& choice : choices)
-    {
-        choicesArr.append(winrt::to_string(choice));
-    }
-    Json::StreamWriterBuilder wb;
-    wb["indentation"] = "";
-    const auto choicesJson = winrt::to_hstring(Json::writeString(wb, choicesArr));
-
-    const auto host = s_emperor->GetMostRecentWindow();
-    THROW_HR_IF(E_FAIL, !host);
-
-    const auto page = _getPage(host);
-    THROW_HR_IF(E_FAIL, !page);
-
-    const auto resultJson = winrt::to_string(
-        co_await page.ShowProtocolQuickPick(title, choicesJson, allowFreeInput));
-    THROW_HR_IF(E_FAIL, resultJson.empty());
-
-    Json::Value r;
-    THROW_HR_IF(E_FAIL, !_parseJson(resultJson, r));
-
-    Protocol::QuickPickResult result{};
-    result.Cancelled = r.get("cancelled", true).asBool();
-    result.Selected = winrt::to_hstring(r.get("selected", "").asString());
-    co_return result;
 }
 
 // ============================================================================

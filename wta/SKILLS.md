@@ -21,7 +21,6 @@
 | `wta split-pane` | `splitw` | Split a pane horizontally/vertically |
 | `wta kill-pane` | `killp` | Close a pane |
 | `wta wait-for` | — | Block until a pane's process exits |
-| `wta quick-pick` | — | Show a choice dialog in WT and get user selection |
 
 ## Discovering Panes
 
@@ -94,18 +93,10 @@ wta split-pane -v
 wta split-pane -t <PANE_ID> -H -c "npm run dev"
 ```
 
-## Asking the User (Quick Pick)
+## Asking the User
 
-```bash
-# Show a choice dialog — blocks until user picks or types
-wta quick-pick "What should I do next?" "Fix the bug" "Add tests" "Refactor code"
-
-# Allow freeform text input alongside choices
-wta quick-pick --free-input "Pick a database:" "PostgreSQL" "MySQL" "SQLite"
-
-# The selected text is printed to stdout
-result=$(wta quick-pick "Continue?" "Yes" "No")
-```
+Use the agent's built-in permission/confirmation flow (ACP `request_permission`)
+or prompt via the agent UI. WTA no longer ships a dedicated `quick-pick` CLI.
 
 ## Common Workflows
 
@@ -136,10 +127,6 @@ wta capture-pane -t <NEW_PANE_ID> -l 50
 ```
 
 ### Interactive user confirmation
-```bash
-# Ask the user before proceeding
-choice=$(wta quick-pick "Deploy to production?" "Yes, deploy" "No, cancel")
-if [ "$choice" = "Yes, deploy" ]; then
-    wta send-keys -t 3 "make deploy" Enter
-fi
-```
+
+For confirmations, prefer the agent's built-in permission flow rather than
+shell prompts.

@@ -766,10 +766,6 @@ namespace winrt::TerminalApp::implementation
         {
             _dispatchAgentPrompt();
         }
-        else if (_currentMode == CommandPaletteMode::QuickPickMode)
-        {
-            _dispatchQuickPick(filteredCommand);
-        }
         else if (_currentMode == CommandPaletteMode::TabSwitchMode || _currentMode == CommandPaletteMode::TabSearchMode)
         {
             _switchToTab(filteredCommand);
@@ -935,28 +931,6 @@ namespace winrt::TerminalApp::implementation
             AgentBackgroundTaskRequested.raise(*this, promptText);
         }
 
-        _close();
-    }
-
-    void CommandPalette::_dispatchQuickPick(const winrt::TerminalApp::FilteredCommand& filteredCommand)
-    {
-        if (!filteredCommand)
-        {
-            return;
-        }
-
-        auto item{ filteredCommand.Item() };
-        if (item.Type() != PaletteItemType::Action)
-        {
-            return;
-        }
-
-        const auto actionPaletteItem{ winrt::get_self<ActionPaletteItem>(item) };
-        auto command{ actionPaletteItem->Command() };
-
-        // Raise the event BEFORE closing so the handler can set the result
-        // and signal the I/O thread before the visibility callback fires.
-        QuickPickCompleted.raise(*this, command.Name());
         _close();
     }
 
@@ -1243,12 +1217,6 @@ namespace winrt::TerminalApp::implementation
             PrefixCharacter(L"&");
             modeAnnouncementResourceKey = USES_RESOURCE(L"CommandPaletteModeAnnouncement_AgentBackgroundMode");
             break;
-        case CommandPaletteMode::QuickPickMode:
-            SearchBoxPlaceholderText(L"Select an option...");
-            NoMatchesText(RS_(L"CommandPalette_NoMatchesText/Text"));
-            ControlName(RS_(L"CommandPaletteControlName"));
-            PrefixCharacter(L"");
-            break;
         case CommandPaletteMode::ActionMode:
         default:
             SearchBoxPlaceholderText(RS_(L"CommandPalette_SearchBox/PlaceholderText"));
@@ -1299,7 +1267,7 @@ namespace winrt::TerminalApp::implementation
         {
             std::copy(begin(commandsToFilter), end(commandsToFilter), std::back_inserter(actions));
         }
-        else if (_currentMode == CommandPaletteMode::TabSearchMode || _currentMode == CommandPaletteMode::ActionMode || _currentMode == CommandPaletteMode::CommandlineMode || _currentMode == CommandPaletteMode::QuickPickMode)
+        else if (_currentMode == CommandPaletteMode::TabSearchMode || _currentMode == CommandPaletteMode::ActionMode || _currentMode == CommandPaletteMode::CommandlineMode)
         {
             auto pattern = std::make_shared<fzf::matcher::Pattern>(fzf::matcher::ParsePattern(searchText));
 
@@ -1391,38 +1359,6 @@ namespace winrt::TerminalApp::implementation
             auto nestedActionPaletteItem{ winrt::make<winrt::TerminalApp::implementation::ActionPaletteItem>(action, winrt::hstring{}) };
             auto nestedFilteredCommand{ winrt::make<FilteredCommand>(nestedActionPaletteItem) };
             _currentNestedCommands.Append(nestedFilteredCommand);
-        }
-    }
-
-    void CommandPalette::SetQuickPickCommands(IVector<Command> const& commands)
-    {
-        _currentMode = CommandPaletteMode::QuickPickMode;
-        ParsedCommandLineText(L"");
-        _searchBox().Text(L"");
-        _searchBox().Select(_searchBox().Text().size(), 0);
-        _nestedActionStack.Clear();
-        ParentCommandName(L"");
-        _currentNestedCommands.Clear();
-
-        SearchBoxPlaceholderText(L"Select an option...");
-        NoMatchesText(RS_(L"CommandPalette_NoMatchesText/Text"));
-        ControlName(RS_(L"CommandPaletteControlName"));
-        PrefixCharacter(L"");
-
-        _allCommands.Clear();
-        for (const auto& action : commands)
-        {
-            auto actionPaletteItem{ winrt::make<winrt::TerminalApp::implementation::ActionPaletteItem>(action, winrt::hstring{}) };
-            auto filteredCommand{ winrt::make<FilteredCommand>(actionPaletteItem) };
-            _allCommands.Append(filteredCommand);
-        }
-
-        // Pre-populate filtered actions (palette is not visible yet).
-        auto actions = _collectFilteredActions();
-        _filteredActions.Clear();
-        for (const auto& action : actions)
-        {
-            _filteredActions.Append(action);
         }
     }
 

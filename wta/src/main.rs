@@ -1068,7 +1068,7 @@ async fn run_default_tui(cli: Cli) -> Result<()> {
     let mut wt_protocol_channel: Option<Arc<CliChannel>> = None;
     let wt_connected = match connect_to_wt_protocol(debug_tx.clone()).await {
         Ok(channel) => {
-            tracing::info!("Connected to WT pipe OK — subscribing to events");
+            tracing::info!("Connected to WT COM protocol — subscribing to events");
             // Subscribe to push events before wrapping in Arc.
             wt_event_rx = Some(channel.subscribe_events());
             let cli_arc = Arc::new(channel);

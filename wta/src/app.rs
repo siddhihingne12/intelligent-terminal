@@ -2064,7 +2064,7 @@ impl App {
                 }
                 // Setup-mode spinner: ticks while we're showing the wizard
                 // (e.g. spinning during a `winget install` background job).
-                if self.mode == AppMode::Setup {
+                if self.mode == AppMode::Setup || self.mode == AppMode::Auth {
                     self.activity_frame = self.activity_frame.wrapping_add(1);
                 }
                 // Age and auto-dismiss notifications
@@ -3196,6 +3196,9 @@ impl App {
     }
 
     fn has_activity_indicator(&self) -> bool {
+        if self.mode == AppMode::Setup || self.mode == AppMode::Auth {
+            return true; // spinner always ticks in setup/auth mode
+        }
         let tab = self.current_tab();
         tab.prompt_in_flight || tab.agent_streaming || tab.progress_status.is_some()
     }

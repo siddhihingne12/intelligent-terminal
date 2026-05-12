@@ -690,11 +690,30 @@ fn install_for_gemini(home: &Path) {
     // install (e.g. from the Settings UI's "Install hooks" button)
     // hangs the timeout. Verified by manual probe in #17.
     //
-    // Idempotency: `gemini extensions install` exits 1 with stderr
-    // "Extension \"wt-agent-hooks\" is already installed. Please
-    // uninstall it first." when the extension is already present.
-    // Match on `already installed` to convert that to success.
-    if let Err(e) = run_plugin_cli(
+    // `GEMINI_CLI_TRUST_WORKSPACE=true`: Gemini 0.41.2 also gates
+    // `extensions install` behind a *folder-trust* prompt that
+    // `--consent` does NOT cover ("Do you trust the files in this
+    // folder? [y/N]"). Without this, the install hangs on stdin and
+    // the Settings UI's "Install hooks" button times out at 60s
+    // (issue: install_for_gemini timed out in wta-install-hooks.log
+    // after Claude + Copilot succeeded). The `--skip-trust` flag is
+    // top-level only and isn't accepted on the `extensions install`
+    // subcommand, so we use the env-var form Gemini documents for
+    // headless / automated environments. See:
+    // https://geminicli.com/docs/cli/trusted-folders/#headless-and-automated-environments
+    //
+    // Idempotency / libuv-crash tolerance: `gemini extensions install`
+    // exits 1 with stderr "Extension \"wt-agent-hooks\" is already
+    // installed. Please uninstall it first." when the extension is
+    // already present — match on `already installed` to convert that
+    // to success. Additionally, on a *fresh* install Gemini CLI 0.41.2
+    // prints `Extension "wt-agent-hooks" installed successfully and
+    // enabled.` and then the Node/libuv runtime aborts with
+    // `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)` and
+    // exit code `0xC0000409`. The extension files are already on disk
+    // at that point, so match the success line to avoid a misleading
+    // `gemini extensions install failed` warning in the trace log.
+    if let Err(e) = run_plugin_cli_with_env(
         "gemini",
         &[
             "extensions",
@@ -703,8 +722,9 @@ fn install_for_gemini(home: &Path) {
             "--consent",
             "--skip-settings",
         ],
+        &[("GEMINI_CLI_TRUST_WORKSPACE", "true")],
         "gemini_hooks",
-        &["already installed"],
+        &["already installed", "installed successfully and enabled"],
     ) {
         tracing::warn!(
             target: "gemini_hooks",
@@ -1362,6 +1382,7 @@ fn copilot_uninstall(_home: Option<&Path>) -> CliUninstallResult {
             &mut out.messages,
             "copilot",
             &["plugin", "uninstall", &plugin_ref],
+            &[],
         ));
         // `--force`: marketplace removal would otherwise refuse if
         // anything is still installed under it (e.g. previous step
@@ -1370,6 +1391,7 @@ fn copilot_uninstall(_home: Option<&Path>) -> CliUninstallResult {
             &mut out.messages,
             "copilot",
             &["plugin", "marketplace", "remove", MARKETPLACE_NAME, "--force"],
+            &[],
         ));
     } else {
         out.messages
@@ -1397,11 +1419,13 @@ fn claude_uninstall(home: Option<&Path>) -> CliUninstallResult {
             &mut out.messages,
             "claude",
             &["plugin", "uninstall", &plugin_ref],
+            &[],
         ));
         out.marketplace_removed = Some(spawn_step(
             &mut out.messages,
             "claude",
             &["plugin", "marketplace", "remove", MARKETPLACE_NAME],
+            &[],
         ));
     } else {
         out.messages
@@ -1442,10 +1466,31 @@ fn gemini_uninstall(home: Option<&Path>) -> CliUninstallResult {
     let cli_ok = which::which("gemini").is_ok();
     if cli_ok {
         out.attempted = true;
+        // Gemini CLI 0.41.2 has two non-fatal exit-1 conditions on
+        // `extensions uninstall` that we want reported as `ok`:
+        //
+        // 1. Libuv shutdown crash. The extension is removed and
+        //    `Extension "wt-agent-hooks" successfully uninstalled.`
+        //    is printed; then Node aborts with
+        //    `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`
+        //    and exit code `0xC0000409` (-1073740791).
+        //
+        // 2. Already-uninstalled idempotency. If the extension dir
+        //    is already gone (e.g. user ran uninstall twice, or a
+        //    previous run only left the on-disk dir behind),
+        //    Gemini exits 1 with stderr
+        //    `Failed to uninstall "wt-agent-hooks": Extension not found.`
+        //    The desired state (extension absent) is achieved either
+        //    way.
+        //
+        // Either substring matching converts the failure to a clean
+        // `ok` line so `wta hooks uninstall` and the Settings UI's
+        // status report don't mislead users.
         out.plugin_uninstalled = Some(spawn_step(
             &mut out.messages,
             "gemini",
             &["extensions", "uninstall", GEMINI_EXTENSION_DIR_NAME],
+            &["successfully uninstalled", "extension not found"],
         ));
     } else {
         out.messages
@@ -1487,10 +1532,38 @@ fn gemini_uninstall(home: Option<&Path>) -> CliUninstallResult {
 /// Spawn `<exe>` with `args` and append a one-line summary to
 /// `messages`. Returns true on success. Never propagates errors —
 /// uninstall is best-effort by design.
-fn spawn_step(messages: &mut Vec<String>, exe: &str, args: &[&str]) -> bool {
+///
+/// `success_substrings`: lower-cased stdout+stderr snippets that mean
+/// "the CLI actually finished its work even if the process exited
+/// non-zero". Used for CLIs that print a clear success line and then
+/// crash on shutdown — e.g., Gemini CLI 0.41.2 prints
+/// `Extension "wt-agent-hooks" successfully uninstalled.` and then
+/// the underlying Node/libuv runtime aborts with exit code
+/// `0xC0000409` and `Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)`.
+/// In that scenario the on-disk extension was already removed and the
+/// non-zero exit is purely a Node bug; we record it as `ok` so the
+/// human-readable uninstall report doesn't mislead the user.
+fn spawn_step(
+    messages: &mut Vec<String>,
+    exe: &str,
+    args: &[&str],
+    success_substrings: &[&str],
+) -> bool {
     match run_plugin_cli_capture(exe, args) {
         Ok(o) if o.success => {
             messages.push(format!("ok: {} {}", exe, args.join(" ")));
+            true
+        }
+        Ok(o) if matches_idempotency_substring(&o.stdout, &o.stderr, success_substrings) => {
+            messages.push(format!(
+                "ok ({} printed success despite exit {}): {} {}",
+                exe,
+                o.status_code
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                exe,
+                args.join(" "),
+            ));
             true
         }
         Ok(o) => {
@@ -1615,6 +1688,20 @@ struct CliRunOutcome {
 /// resolve through `which::which` first to get the full path
 /// (including the extension) and spawn that.
 fn run_plugin_cli_capture(exe: &str, args: &[&str]) -> std::io::Result<CliRunOutcome> {
+    run_plugin_cli_capture_with_env(exe, args, &[])
+}
+
+/// Same as [`run_plugin_cli_capture`] but injects the supplied
+/// `(name, value)` pairs into the spawned child's environment.
+/// Used by `install_for_gemini` to set
+/// `GEMINI_CLI_TRUST_WORKSPACE=true` so `gemini extensions install`
+/// doesn't hang on the headless folder-trust prompt; behaves
+/// identically to `run_plugin_cli_capture` when `env` is empty.
+fn run_plugin_cli_capture_with_env(
+    exe: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::io::Result<CliRunOutcome> {
     use std::process::Stdio;
     let resolved = which::which(exe).ok();
     let mut cmd = match &resolved {
@@ -1625,6 +1712,9 @@ fn run_plugin_cli_capture(exe: &str, args: &[&str]) -> std::io::Result<CliRunOut
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
 
     #[cfg(windows)]
     {
@@ -1668,21 +1758,39 @@ fn run_plugin_cli_capture(exe: &str, args: &[&str]) -> std::io::Result<CliRunOut
 /// steps.
 ///
 /// `idempotency_substrings`: lower-cased stdout+stderr snippets that
-/// indicate "already in the desired state" — when the spawned CLI exits
-/// non-zero AND its captured output contains any of these substrings,
-/// we convert the failure to `Ok(())` and log at info!. Wired per-call-
-/// site (verified by manual probe in #17, the "Track 1" PR):
+/// indicate "the goal state was reached even though the process exited
+/// non-zero" — either because the work was already done (idempotency)
+/// or because the CLI crashed *after* printing a clear success line
+/// (e.g., Gemini CLI 0.41.2's libuv `UV_HANDLE_CLOSING` shutdown
+/// crash, exit code `0xC0000409`). When any substring matches, we
+/// convert the failure to `Ok(())` and log at info!. Wired per-call-
+/// site:
 ///   * `copilot plugin marketplace add`  -> `["already registered"]`
-///   * `gemini extensions install`       -> `["already installed"]`
+///   * `gemini extensions install`       -> `["already installed",
+///                                            "installed successfully and enabled"]`
 ///   * everything else (claude marketplace add / install + copilot
 ///     plugin install) is already exit-0 idempotent on the CLI side.
 fn run_plugin_cli(
     exe: &str,
     args: &[&str],
+    log_target: &str,
+    idempotency_substrings: &[&str],
+) -> std::io::Result<()> {
+    run_plugin_cli_with_env(exe, args, &[], log_target, idempotency_substrings)
+}
+
+/// Same as [`run_plugin_cli`] but injects the supplied `(name, value)`
+/// pairs into the spawned child's environment. See
+/// [`run_plugin_cli_capture_with_env`] for the underlying mechanics
+/// and the `install_for_gemini` use case.
+fn run_plugin_cli_with_env(
+    exe: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
     _log_target: &str,
     idempotency_substrings: &[&str],
 ) -> std::io::Result<()> {
-    let outcome = run_plugin_cli_capture(exe, args)?;
+    let outcome = run_plugin_cli_capture_with_env(exe, args, env)?;
     if !outcome.success {
         if matches_idempotency_substring(
             &outcome.stdout,
@@ -2770,6 +2878,104 @@ Registered marketplaces:
             "",
             &["already registered", "already installed"],
         ));
+    }
+
+    /// Models the Gemini CLI 0.41.2 libuv shutdown crash:
+    /// `extensions install` writes the extension and prints the
+    /// success line, then Node.js aborts with exit code `0xC0000409`
+    /// during async-handle teardown. The captured success substring
+    /// must convert that into a logical success so the install-side
+    /// trace log doesn't claim "gemini extensions install failed"
+    /// for an install that actually wrote the files to disk.
+    #[test]
+    fn idempotency_substring_matches_gemini_install_success_after_libuv_crash() {
+        let stderr = "You have consented to the following:\n\
+            ...legal blurb...\n\
+            Extension \"wt-agent-hooks\" installed successfully and enabled.\n\
+            Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), \
+            file src\\win\\async.c, line 76";
+        assert!(matches_idempotency_substring(
+            "",
+            stderr,
+            &["already installed", "installed successfully and enabled"],
+        ));
+    }
+
+    /// Mirror of the install-side test for the uninstall path. The
+    /// `spawn_step` success-substring branch is what makes the
+    /// `wta hooks uninstall` report show `plugin=ok` for Gemini even
+    /// when the same libuv crash fires on `extensions uninstall`.
+    #[test]
+    fn idempotency_substring_matches_gemini_uninstall_success_after_libuv_crash() {
+        let stderr = "Extension \"wt-agent-hooks\" successfully uninstalled.\n\
+            Assertion failed: !(handle->flags & UV_HANDLE_CLOSING), \
+            file src\\win\\async.c, line 76";
+        assert!(matches_idempotency_substring(
+            "",
+            stderr,
+            &["successfully uninstalled"],
+        ));
+    }
+
+    /// Idempotent re-uninstall: if the extension is already gone,
+    /// Gemini exits 1 with `Failed to uninstall "...": Extension not
+    /// found.` That's the desired state, so we treat it as `ok`.
+    #[test]
+    fn idempotency_substring_matches_gemini_extension_not_found() {
+        let stderr = "Failed to uninstall \"wt-agent-hooks\": Extension not found.";
+        assert!(matches_idempotency_substring(
+            "",
+            stderr,
+            &["successfully uninstalled", "extension not found"],
+        ));
+    }
+
+    // ---- spawn_step success-substring tolerance (libuv crash) -----------
+
+    /// `spawn_step` should ordinarily report `fail (...)` when the
+    /// spawned CLI exits non-zero, even if its stdout/stderr happens
+    /// to contain a generic word like "successfully". This guards
+    /// against accidentally widening the success-substring contract.
+    #[test]
+    fn spawn_step_fail_message_format_when_no_success_substrings() {
+        let mut messages = Vec::new();
+        // `cmd /c exit 7` is exit-7 and prints nothing. Use an exe
+        // we know is on PATH on every Windows box so the test isn't
+        // flaky on dev machines that don't have gemini installed.
+        let ok = spawn_step(&mut messages, "cmd", &["/c", "exit", "7"], &[]);
+        assert!(!ok);
+        assert_eq!(messages.len(), 1);
+        let m = &messages[0];
+        assert!(m.starts_with("fail (7):"), "unexpected: {m}");
+        assert!(m.contains("cmd /c exit 7"));
+    }
+
+    /// When the spawned CLI exits non-zero but its captured output
+    /// contains a registered success substring, `spawn_step` records
+    /// `ok (...)` and returns `true`. This covers the Gemini libuv
+    /// crash path.
+    #[test]
+    fn spawn_step_treats_success_substring_as_ok_despite_nonzero_exit() {
+        let mut messages = Vec::new();
+        // PowerShell prints the success line to stdout, then exits 1.
+        // `-NoProfile` keeps it fast and predictable in CI.
+        let ok = spawn_step(
+            &mut messages,
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Write-Host 'Extension \"wt-agent-hooks\" successfully uninstalled.'; exit 1",
+            ],
+            &["successfully uninstalled"],
+        );
+        assert!(ok, "spawn_step should treat success substring as ok");
+        assert_eq!(messages.len(), 1);
+        let m = &messages[0];
+        assert!(
+            m.starts_with("ok (powershell printed success despite exit 1):"),
+            "unexpected: {m}"
+        );
     }
 
     // ---- marketplace path validity (#25) --------------------------------

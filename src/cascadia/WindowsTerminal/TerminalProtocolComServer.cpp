@@ -9,8 +9,11 @@
 
 #include <json/json.h>
 #include <til/io.h>
+#include "../TerminalProtocol/ProtocolParsing.h"
 
 #include <thread>
+
+namespace ProtocolParsing = Microsoft::Terminal::Protocol::Parsing;
 
 namespace Protocol = winrt::Microsoft::Terminal::Protocol;
 
@@ -525,30 +528,10 @@ Protocol::TabCreationResult TerminalProtocolComServer::SplitPane(
     THROW_HR_IF(E_NOT_VALID_STATE, !s_emperor);
     THROW_HR_IF(E_INVALIDARG, sessionId == winrt::guid{});
 
-    // Map direction string to SplitDirection enum.
-    // Accepts: "right" (default), "left", "up", "down", "auto"/"automatic".
-    // Legacy values "horizontal"/"vertical" are honoured as down/right respectively
-    // so older callers (early wtcli builds) keep working instead of silently
-    // collapsing into the default Right.
-    auto splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Right;
-    if (!direction.empty())
-    {
-        const auto dirStr = winrt::to_string(direction);
-        if (dirStr == "right")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Right;
-        else if (dirStr == "left")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Left;
-        else if (dirStr == "up")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Up;
-        else if (dirStr == "down")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Down;
-        else if (dirStr == "auto" || dirStr == "automatic")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Automatic;
-        else if (dirStr == "horizontal")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Down;
-        else if (dirStr == "vertical")
-            splitDir = winrt::Microsoft::Terminal::Settings::Model::SplitDirection::Right;
-    }
+    // Map direction string to SplitDirection enum via shared parsing logic.
+    const auto parsedDir = ProtocolParsing::ParseSplitDirection(winrt::to_string(direction));
+    auto splitDir = static_cast<winrt::Microsoft::Terminal::Settings::Model::SplitDirection>(
+        static_cast<int>(parsedDir));
 
     // Build NewTerminalArgs.
     winrt::Microsoft::Terminal::Settings::Model::NewTerminalArgs newTermArgs;
@@ -633,6 +616,93 @@ void TerminalProtocolComServer::SetSessionVariable(
     winrt::throw_hresult(E_FAIL);
 }
 
+winrt::hstring TerminalProtocolComServer::SetSettings(
+    winrt::hstring const& settingsContent)
+{
+    const auto contentStr = winrt::to_string(settingsContent);
+    THROW_HR_IF(E_INVALIDARG, !ProtocolParsing::ValidateSettingsJson(contentStr));
+
+    // Get the settings path and create a backup.
+    const std::filesystem::path settingsPath{
+        std::wstring_view{ winrt::Microsoft::Terminal::Settings::Model::CascadiaSettings::SettingsPath() }
+    };
+    const auto settingsDir = settingsPath.parent_path();
+
+    // Create timestamped backup.
+    const auto now = std::chrono::system_clock::now();
+    const auto time = std::chrono::system_clock::to_time_t(now);
+    std::tm tm{};
+    localtime_s(&tm, &time);
+
+    wchar_t timeStr[64];
+    wcsftime(timeStr, std::size(timeStr), L"%Y-%m-%dT%H-%M-%S", &tm);
+
+    const auto backup = settingsDir / fmt::format(L"settings.backup.{}.json", timeStr);
+
+    // Copy current settings to backup.
+    std::error_code ec;
+    std::filesystem::copy_file(settingsPath, backup, std::filesystem::copy_options::overwrite_existing, ec);
+
+    // Clean up old backups — keep only the most recent 5.
+    std::vector<std::filesystem::path> backups;
+    for (const auto& entry : std::filesystem::directory_iterator(settingsDir, ec))
+    {
+        if (entry.is_regular_file() && entry.path().filename().wstring().starts_with(L"settings.backup."))
+            backups.push_back(entry.path());
+    }
+    if (backups.size() > 5)
+    {
+        std::sort(backups.begin(), backups.end());
+        for (size_t i = 0; i < backups.size() - 5; ++i)
+            std::filesystem::remove(backups[i], ec);
+    }
+
+    // Write the new settings.
+    til::io::write_utf8_string_to_file_atomic(settingsPath, contentStr);
+
+    return winrt::hstring{ backup.wstring() };
+}
+
+// ============================================================================
+// Interactive
+// ============================================================================
+
+winrt::Windows::Foundation::IAsyncOperation<Protocol::QuickPickResult> TerminalProtocolComServer::QuickPick(
+    winrt::hstring const& title,
+    winrt::array_view<winrt::hstring const> choices,
+    bool allowFreeInput)
+{
+    THROW_HR_IF(E_NOT_VALID_STATE, !s_emperor);
+
+    // Serialize choices to JSON before any co_await (array_view is non-owning).
+    Json::Value choicesArr(Json::arrayValue);
+    for (const auto& choice : choices)
+    {
+        choicesArr.append(winrt::to_string(choice));
+    }
+    Json::StreamWriterBuilder wb;
+    wb["indentation"] = "";
+    const auto choicesJson = winrt::to_hstring(Json::writeString(wb, choicesArr));
+
+    const auto host = s_emperor->GetMostRecentWindow();
+    THROW_HR_IF(E_FAIL, !host);
+
+    const auto page = _getPage(host);
+    THROW_HR_IF(E_FAIL, !page);
+
+    const auto resultJson = winrt::to_string(
+        co_await page.ShowProtocolQuickPick(title, choicesJson, allowFreeInput));
+    THROW_HR_IF(E_FAIL, resultJson.empty());
+
+    Json::Value r;
+    THROW_HR_IF(E_FAIL, !_parseJson(resultJson, r));
+
+    Protocol::QuickPickResult result{};
+    result.Cancelled = r.get("cancelled", true).asBool();
+    result.Selected = winrt::to_hstring(r.get("selected", "").asString());
+    co_return result;
+}
+
 // ============================================================================
 // Events — push-based via callback
 // ============================================================================
@@ -661,40 +731,29 @@ void TerminalProtocolComServer::SendEvent(winrt::hstring const& eventJson)
 {
     THROW_HR_IF(E_ACCESSDENIED, !_authenticated);
 
-    // Parse and validate the incoming JSON
     auto jsonStr = winrt::to_string(eventJson);
     Json::Value evt;
-    THROW_HR_IF(E_INVALIDARG, !_parseJson(jsonStr, evt));
+    const auto route = ProtocolParsing::ClassifySendEvent(jsonStr, evt);
+    THROW_HR_IF(E_INVALIDARG, route == ProtocolParsing::SendEventRoute::Invalid);
 
-    // autofix_state is a direct WTA → TerminalPage signal (no broadcast to
-    // other wtcli clients). Marshal to the UI thread and call the page.
-    if (evt.isMember("method") && evt["method"].isString() &&
-        evt["method"].asString() == "autofix_state")
+    switch (route)
     {
+    case ProtocolParsing::SendEventRoute::AutofixState:
         _dispatchAutofixStateToPage(eventJson);
         return;
-    }
-
-    // agent_status carries name/version/model/state for the XAML AgentBar.
-    // Same dispatch shape as autofix_state — direct to TerminalPage, no broadcast.
-    if (evt.isMember("method") && evt["method"].isString() &&
-        evt["method"].asString() == "agent_status")
-    {
+    case ProtocolParsing::SendEventRoute::AgentStatus:
         _dispatchAgentStatusToPage(eventJson);
         return;
+    case ProtocolParsing::SendEventRoute::Broadcast:
+    {
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        s_NotifyEventToComClients(Json::writeString(wb, evt));
+        return;
     }
-
-    // Legacy path: params.event is required for agent_event broadcasts.
-    THROW_HR_IF(E_INVALIDARG, !evt.isMember("params") || !evt["params"].isMember("event"));
-
-    // Normalize the envelope
-    evt["type"] = "event";
-    evt["method"] = "agent_event";
-
-    // Broadcast to all subscribed clients via the existing path
-    Json::StreamWriterBuilder wb;
-    wb["indentation"] = "";
-    s_NotifyEventToComClients(Json::writeString(wb, evt));
+    default:
+        return;
+    }
 }
 
 void TerminalProtocolComServer::_dispatchAutofixStateToPage(const winrt::hstring& eventJson)

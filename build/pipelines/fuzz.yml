@@ -71,3 +71,9 @@ stages:
           env:
             target_exe_path: $(Build.ArtifactStagingDirectory)/WtcliFuzzer.exe
             test_name: WtcliInputParsing
+        - bash: |
+            onefuzz template libfuzzer basic --colocate_all_tasks --vm_count 1 --target_exe $target_exe_path --notification_config @./build/Fuzz/notifications-ado.json OpenConsole $test_name $(Build.SourceVersion) default
+          displayName: Submit OneFuzz Job — ProtocolFuzzer
+          env:
+            target_exe_path: $(Build.ArtifactStagingDirectory)/ProtocolFuzzer.exe
+            test_name: ProtocolServerParsing

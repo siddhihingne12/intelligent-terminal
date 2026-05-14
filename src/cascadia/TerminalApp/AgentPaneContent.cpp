@@ -84,8 +84,32 @@ namespace winrt::TerminalApp::implementation
         }
     }
 
+    // Swap the bar between two modes:
+    //   * chat / connecting / etc. (active=false) — agent logo + "<name> <version>"
+    //   * session-management view  (active=true)  — no logo, "Agent sessions"
+    // Idempotent so callers don't need to dedupe.
+    void AgentPaneContent::SetSessionsView(bool active)
+    {
+        if (_isSessionsView == active)
+        {
+            return;
+        }
+        _isSessionsView = active;
+        _refreshLabel();
+        _refreshLogo();
+    }
+
     void AgentPaneContent::_refreshLabel()
     {
+        // Session-management view takes over the bar — the wta TUI below no
+        // longer renders its own "Agent sessions" header, so this is where
+        // that title lives.
+        if (_isSessionsView)
+        {
+            AgentLabelText().Text(L"Agent sessions");
+            return;
+        }
+
         // Composition rule:
         //     "<name> <version>"   if version present (version may already include "v" prefix)
         //     "<name> <model>"     else if model present
@@ -115,6 +139,14 @@ namespace winrt::TerminalApp::implementation
 
     void AgentPaneContent::_refreshLogo()
     {
+        // Sessions view: the bar shows only the "Agent sessions" title
+        // (Figma node 912:70364 — no per-agent logo on the session list).
+        if (_isSessionsView)
+        {
+            AgentLogo().Source(nullptr);
+            return;
+        }
+
         // No agent name yet → hide logo entirely (don't default to Copilot).
         if (_agentName.empty())
         {

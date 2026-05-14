@@ -1677,11 +1677,13 @@ namespace winrt::TerminalApp::implementation
             OutputDebugStringW(L"[AgentPane] OpenAgentPane: switch to chat — pane visible and in sessions view\n");
             _BroadcastAgentSetView("chat");
             _agentSessionsViewActive = false;
+            _UpdateBottomBarState();
             args.Handled(true);
             return;
         }
 
         _OpenOrReuseAgentPane(L"");
+        _UpdateBottomBarState();
         args.Handled(true);
     }
 
@@ -1720,6 +1722,7 @@ namespace winrt::TerminalApp::implementation
             activeTab->AgentPaneOpen(false);
             _ReconcileAgentPaneForActiveTab();
             _agentSessionsViewActive = false;
+            _UpdateBottomBarState();
             args.Handled(true);
             return;
         }
@@ -1729,6 +1732,7 @@ namespace winrt::TerminalApp::implementation
         // intoSessionsView=true code path, which sets _agentSessionsViewActive
         // = true on success.
         _OpenOrReuseAgentPane(L"", /*intoSessionsView*/ true);
+        _UpdateBottomBarState();
         args.Handled(true);
     }
 

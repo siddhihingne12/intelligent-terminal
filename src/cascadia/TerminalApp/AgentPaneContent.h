@@ -22,6 +22,8 @@ namespace winrt::TerminalApp::implementation
                                const winrt::hstring& model,
                                const winrt::hstring& state);
 
+        void SetSessionsView(bool active);
+
 #pragma region IPaneContent
         winrt::Windows::UI::Xaml::FrameworkElement GetRoot();
 
@@ -54,6 +56,10 @@ namespace winrt::TerminalApp::implementation
         winrt::hstring _agentVersion{};
         winrt::hstring _agentModel{};
         winrt::hstring _agentState{};
+
+        // When true, the bar replaces "<agent> <version>" with "Agent sessions"
+        // and hides the agent logo. Driven by TerminalPage::_BroadcastAgentSetView.
+        bool _isSessionsView{ false };
 
         // Inner content event tokens — forwarded to our own BasicPaneEvents.
         winrt::event_token _innerCloseRequested{};

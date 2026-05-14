@@ -3516,6 +3516,32 @@ namespace winrt::TerminalApp::implementation
         _UpdateBottomBarState();
     }
 
+    // Open (or reuse) the agent pane and switch wta into the Agents/sessions
+    // view — same toggle semantics as the Ctrl+Shift+/ keybinding:
+    //   - pane not visible on active tab → open + sessions view
+    //   - pane visible AND already in sessions view → close
+    //   - pane visible but in chat view → switch to sessions
+    void TerminalPage::_SessionToggleButtonOnClick(const IInspectable& /*sender*/,
+                                                    const RoutedEventArgs& /*eventArgs*/)
+    {
+        const auto pane = _FindAgentPane();
+        const auto activeTab = _GetFocusedTabImpl();
+        const bool visibleOnActiveTab =
+            pane && activeTab && (_FindTabContainingAgentPane() == activeTab) && !pane->IsHidden();
+
+        if (visibleOnActiveTab && _agentSessionsViewActive)
+        {
+            activeTab->AgentPaneOpen(false);
+            _ReconcileAgentPaneForActiveTab();
+            _agentSessionsViewActive = false;
+            _UpdateBottomBarState();
+            return;
+        }
+
+        _OpenOrReuseAgentPane(L"", /*intoSessionsView*/ true);
+        _UpdateBottomBarState();
+    }
+
     void TerminalPage::_DiagnosticsButtonOnClick(const IInspectable& /*sender*/,
                                                   const RoutedEventArgs& /*eventArgs*/)
     {

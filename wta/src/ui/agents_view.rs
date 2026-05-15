@@ -56,7 +56,7 @@ pub fn render(
     // the 1 live session) and dismiss the view before the scan finished.
     if history_load_state == HistoryLoadState::Loading {
         let mut spans: Vec<Span<'static>> = vec![Span::raw("  ")];
-        spans.extend(shimmer::shimmer_spans("Loading", activity_frame));
+        spans.extend(shimmer::shimmer_spans("Loading...", activity_frame));
         let loading = Paragraph::new(Line::from(spans));
         f.render_widget(loading, list_area);
         return;

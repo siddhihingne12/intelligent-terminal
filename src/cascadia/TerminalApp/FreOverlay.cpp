@@ -129,6 +129,18 @@ namespace winrt::TerminalApp::implementation
         }
     }
 
+    void FreOverlay::_OnSessionManagementToggled(const IInspectable& /*sender*/,
+                                                  const RoutedEventArgs& /*args*/)
+    {
+        // Guard: event can fire during InitializeComponent before controls exist
+        auto toggle = SessionManagementToggle();
+        auto hint = SessionManagementHint();
+        if (toggle && hint)
+        {
+            hint.Visibility(toggle.IsOn() ? Visibility::Visible : Visibility::Collapsed);
+        }
+    }
+
     // ── Page navigation ─────────────────────────────────────────────────
 
     void FreOverlay::_OnNextButtonClick(const IInspectable& /*sender*/,
@@ -269,12 +281,15 @@ namespace winrt::TerminalApp::implementation
             }
         }
 
-        // 4. Install hooks (non-blocking — agent works without hooks)
+        // 4. Install hooks if session management is enabled
         {
             auto self = weak.get();
             if (!self) co_return;
 
-            co_await _InstallHooksAsync(agentId);
+            if (SessionManagementToggle().IsOn())
+            {
+                co_await _InstallHooksAsync(agentId);
+            }
         }
 
         // 5. Install shell integration for autofix (if enabled)

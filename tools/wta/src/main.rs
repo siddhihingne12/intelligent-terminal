@@ -1703,11 +1703,7 @@ async fn run_acp_app(
                 // Prefer the canonical id the host passed via `--agent-id`
                 // — that's the user's actual setting value (`acpAgent`).
                 // Fall back to reverse-parsing the `--agent` command line
-                // for manual runs / older hosts. The fallback handles bare
-                // names cleanly but is fragile for adapter-style launches
-                // (`npx -y …claude-code-acp` → "claude") and full-path
-                // launches (`C:\…\copilot.exe` → "copilot"), which is the
-                // whole reason `--agent-id` exists.
+                // for manual runs / older hosts.
                 let canonical_id: String = cli
                     .agent_id
                     .as_deref()
@@ -1725,14 +1721,6 @@ async fn run_acp_app(
                     source = if cli.agent_id.is_some() { "--agent-id" } else { "resolved-from-cmd" },
                     "current_agent_id assigned",
                 );
-                // `agent_check::check_agent` accepts the canonical id and
-                // reuses the existing preflight code path (exe discovery,
-                // credential check). For adapter launches we deliberately
-                // probe the adapted CLI (`claude` / `codex`) rather than
-                // the `npx` wrapper, since auth lives on the underlying
-                // CLI's credential store. Custom agent ids (`custom:foo`)
-                // fall through to the unknown profile, which is fine —
-                // preflight is best-effort for those.
                 let agent_id = canonical_id.as_str();
                 let status = agent_check::check_agent(agent_id);
                 let preflight_result = app::PreflightResult {

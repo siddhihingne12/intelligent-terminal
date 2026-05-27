@@ -49,6 +49,7 @@ chat.plan_header: "Pla:"
 chat.plan_marker_completed: "[x]"  # {Locked}
 chat.plan_marker_in_progress: "[>]"  # {Locked}
 chat.plan_marker_pending: "[ ]"  # {Locked}
+chat.autofix_prompt_label: "Diagnosticada automàticament una fallada recent d'una ordre"
 chat.turn_canceled: "(cancel·lat)"
 chat.turn_executed: "→ executat: %{title}"
 

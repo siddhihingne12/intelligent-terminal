@@ -49,6 +49,7 @@ chat.plan_header: "Plano:"
 chat.plan_marker_completed: "[x]"  # {Locked}
 chat.plan_marker_in_progress: "[>]"  # {Locked}
 chat.plan_marker_pending: "[ ]"  # {Locked}
+chat.autofix_prompt_label: "Falha recente de comando diagnosticada automaticamente"
 chat.turn_canceled: "(cancelado)"
 chat.turn_executed: "→ executado: %{title}"
 

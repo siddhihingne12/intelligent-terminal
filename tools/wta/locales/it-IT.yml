@@ -49,6 +49,7 @@ chat.plan_header: "Piano:"
 chat.plan_marker_completed: "[x]"  # {Locked}
 chat.plan_marker_in_progress: "[>]"  # {Locked}
 chat.plan_marker_pending: "[ ]"  # {Locked}
+chat.autofix_prompt_label: "Diagnosticato automaticamente un errore recente di un comando"
 chat.turn_canceled: "(annullato)"
 chat.turn_executed: "→ eseguito: %{title}"
 

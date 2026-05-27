@@ -50,6 +50,7 @@ chat.plan_header: "[Ṗĺåñ:!!]"
 chat.plan_marker_completed: "[x]"  # {Locked}
 chat.plan_marker_in_progress: "[>]"  # {Locked}
 chat.plan_marker_pending: "[ ]"  # {Locked}
+chat.autofix_prompt_label: "[(Åûţö-ðïåĝñöšéð å réçéñţ çöɱɱåñð ƒåïĺûré!!)]"
 chat.turn_canceled: "[(çåñçéĺéð!!)]"
 chat.turn_executed: "[→ éẋéçûţéð: %{title}!!]"
 

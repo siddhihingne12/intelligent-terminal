@@ -49,6 +49,7 @@ chat.plan_header: "പദ്ധതി:"
 chat.plan_marker_completed: "[x]"  # {Locked}
 chat.plan_marker_in_progress: "[>]"  # {Locked}
 chat.plan_marker_pending: "[ ]"  # {Locked}
+chat.autofix_prompt_label: "സമീപകാല കമാൻഡ് പരാജയം സ്വയം നിർണ്ണയിച്ചു"
 chat.turn_canceled: "(റദ്ദാക്കി)"
 chat.turn_executed: "→ നടപ്പിലാക്കി: %{title}"
 

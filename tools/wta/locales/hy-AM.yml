@@ -53,6 +53,7 @@ chat.plan_header: "Պլան՝"
 chat.plan_marker_completed: "[x]"  # {Locked}
 chat.plan_marker_in_progress: "[>]"  # {Locked}
 chat.plan_marker_pending: "[ ]"  # {Locked}
+chat.autofix_prompt_label: "Վերջին հրամանի ձախողումը ինքնաշխատ ախտորոշվել է"
 chat.turn_canceled: "(չեղարկվել է)"
 chat.turn_executed: "→ կատարվել է: %{title}"
 

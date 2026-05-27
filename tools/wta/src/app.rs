@@ -6310,13 +6310,8 @@ impl App {
                     details.push(ChatMessage::Agent(visible));
                 }
                 if !details.is_empty() {
-                    let pane_label = prompt
-                        .autofix
-                        .as_ref()
-                        .map(|a| a.target_pane_id.clone())
-                        .expect("autofix finalize requires autofix prompt");
                     tab.completed_turns.push(CompletedTurn {
-                        prompt: format!("Auto-diagnosed error in pane {pane_label}"),
+                        prompt: t!("chat.autofix_prompt_label").into_owned(),
                         details,
                         expanded: true,
                         trailing_marker: None,
@@ -6514,14 +6509,14 @@ impl App {
         let new_turn_data: Option<(String, Option<String>)> = match &tab.turn {
             TurnState::Submitted(prompt) => {
                 let label = match prompt.autofix.as_ref() {
-                    Some(a) => format!("Auto-diagnosed error in pane {}", a.target_pane_id),
+                    Some(_) => t!("chat.autofix_prompt_label").into_owned(),
                     None => prompt.text.clone(),
                 };
                 Some((label, None))
             }
             TurnState::Streaming { prompt, buf } => {
                 let label = match prompt.autofix.as_ref() {
-                    Some(a) => format!("Auto-diagnosed error in pane {}", a.target_pane_id),
+                    Some(_) => t!("chat.autofix_prompt_label").into_owned(),
                     None => prompt.text.clone(),
                 };
                 let visible = ui::chat::user_visible_stream_text(buf).map(|c| c.into_owned());
@@ -6641,7 +6636,7 @@ impl App {
         self.emit_autofix_state_armed(&target_tab, &pane_id, &preview);
         let rec_idx = recommended_choice_index(&recommendations);
         let summary = format_recommendations_for_chat(&recommendations);
-        let turn_prompt_label = format!("Auto-diagnosed error in pane {pane_id}");
+        let turn_prompt_label = t!("chat.autofix_prompt_label").into_owned();
         let tab = self.session_tab_mut(session_id);
         let prompt = tab.turn.prompt().cloned().expect("prompt set");
         let mut details = tab.current_turn_details();
@@ -6693,7 +6688,7 @@ impl App {
             ),
         );
 
-        let turn_prompt_label = format!("Auto-diagnosed error in pane {pane_id}");
+        let turn_prompt_label = t!("chat.autofix_prompt_label").into_owned();
         {
             let tab = self.session_tab_mut(session_id);
             let mut details = tab.current_turn_details();

@@ -1795,6 +1795,8 @@ pub struct App {
     restart_tx: mpsc::UnboundedSender<RestartRequest>,
     master_request_tx: mpsc::UnboundedSender<crate::protocol::acp::client::MasterExtRequest>,
     debug_capture_enabled: Arc<AtomicBool>,
+    /// Cached for creating DeferredAcpParams after auth-error recovery.
+    shell_mgr: Arc<crate::shell::ShellManager>,
     // Slash-command UI state. The /help overlay is global — it covers
     // the chat area regardless of which tab is active. Per-tab popup
     // state (the command-completion candidates as the user types `/he…`)
@@ -2010,6 +2012,7 @@ impl App {
         debug_capture_enabled: Arc<AtomicBool>,
         wt_connected: bool,
         autofix_enabled: bool,
+        shell_mgr: Arc<crate::shell::ShellManager>,
     ) -> Self {
         let mut tab_sessions = HashMap::new();
         tab_sessions.insert(DEFAULT_TAB_ID.to_string(), TabSession::default());
@@ -2077,6 +2080,7 @@ impl App {
             transient_hint: None,
             alive: crate::session_registry::InMemoryRegistry::shared(),
             alive_loaded: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shell_mgr,
         }
     }
 
@@ -2125,17 +2129,24 @@ impl App {
 
         if let (Some(ref tx), Some(ref mut params)) = (&self.event_tx, &mut self.deferred_acp) {
             // If channels were consumed by a previous (failed) attempt, create fresh ones.
-            // Also update self.prompt_tx so the App sends prompts to the new ACP client.
+            // Also update all sender fields on self so the App routes to the new ACP client.
             if params.prompt_rx.is_none() {
                 let (ptx, prx) = mpsc::unbounded_channel();
-                let (_ctx, crx) = mpsc::unbounded_channel();
-                let (_ntx, nrx) = mpsc::unbounded_channel();
-                let (_ltx, lrx) = mpsc::unbounded_channel();
-                let (_dtx, drx) = mpsc::unbounded_channel();
-                let (_rntx, rnrx) = mpsc::unbounded_channel();
-                let (_rtx, rrx) = mpsc::unbounded_channel();
-                let (_mtx, mrx) = mpsc::unbounded_channel();
+                let (ctx, crx) = mpsc::unbounded_channel();
+                let (ntx, nrx) = mpsc::unbounded_channel();
+                let (ltx, lrx) = mpsc::unbounded_channel();
+                let (dtx, drx) = mpsc::unbounded_channel();
+                let (rntx, rnrx) = mpsc::unbounded_channel();
+                let (rtx, rrx) = mpsc::unbounded_channel();
+                let (mtx, mrx) = mpsc::unbounded_channel();
                 self.prompt_tx = ptx;
+                self.cancel_tx = ctx;
+                self.new_session_tx = ntx;
+                self.load_session_tx = ltx;
+                self.drop_session_tx = dtx;
+                self.rename_session_tx = rntx;
+                self.restart_tx = rtx;
+                self.master_request_tx = mtx;
                 params.prompt_rx = Some(prx);
                 params.cancel_rx = Some(crx);
                 params.new_session_rx = Some(nrx);
@@ -3224,13 +3235,27 @@ impl App {
                         }
                     }
 
+                    if found_success {
+                        // Stdout confirmed login succeeded — return
+                        // immediately. Don't wait for stderr or the
+                        // child process; copilot login may have spawned
+                        // sub-processes that keep pipes open.
+                        tracing::info!("login: stdout success detected, returning immediately");
+                        let _ = child.kill();
+                        // Don't call child.wait() — it can block if
+                        // sub-processes are still running.
+                        drop(stderr_handle);
+                        return true;
+                    }
+
                     let stderr_success = stderr_handle.join().unwrap_or(false);
-                    found_success = found_success || stderr_success;
+                    found_success = stderr_success;
 
                     if !found_success {
                         // Wait for process and check exit code
                         found_success = child.wait().map(|s| s.success()).unwrap_or(false);
                     } else {
+                        let _ = child.kill();
                         let _ = child.wait();
                     }
                     found_success
@@ -3238,10 +3263,12 @@ impl App {
                 .await;
 
                 let success = result.unwrap_or(false);
-                let _ = tx.send(AppEvent::LoginComplete {
+                tracing::info!("login: spawn_blocking returned, sending LoginComplete success={}", success);
+                let send_result = tx.send(AppEvent::LoginComplete {
                     agent_id: id,
                     success,
                 });
+                tracing::info!("login: LoginComplete send result={:?}", send_result.is_ok());
             });
         }
     }
@@ -5337,6 +5364,7 @@ impl App {
                 }
             }
             AppEvent::LoginComplete { success, .. } => {
+                tracing::info!("LoginComplete received: success={} deferred_acp={}", success, self.deferred_acp.is_some());
                 if success {
                     // Login succeeded → transition to Chat and start ACP
                     self.mode = AppMode::Chat;
@@ -5349,14 +5377,29 @@ impl App {
                         .map(|a| a.agent_id.clone())
                         .unwrap_or_default();
                     self.update_deferred_acp_agent(&agent_id);
-                    if self.deferred_acp.is_some() {
-                        self.pending_acp_start = true;
-                    } else {
+                    // If deferred_acp is None (helper mode — the initial
+                    // ACP client already exited with auth error and dropped
+                    // its channels), create a fresh DeferredAcpParams so
+                    // try_start_acp can spawn a new ACP client.
+                    if self.deferred_acp.is_none() {
                         let new_cmd = self.build_agent_cmd(&agent_id);
-                        let _ = self.restart_tx.send(RestartRequest {
-                            agent_cmd: Some(new_cmd),
+                        tracing::info!("LoginComplete: creating deferred_acp for reconnect cmd={}", new_cmd);
+                        self.deferred_acp = Some(DeferredAcpParams {
+                            agent_cmd: new_cmd,
+                            acp_model: None,
+                            prompt_rx: None, // try_start_acp will create fresh channels
+                            cancel_rx: None,
+                            new_session_rx: None,
+                            load_session_rx: None,
+                            drop_session_rx: None,
+                            rename_session_rx: None,
+                            restart_rx: None,
+                            master_ext_rx: None,
+                            shell_mgr: Arc::clone(&self.shell_mgr),
+                            wt_connected: self.wt_connected,
                         });
                     }
+                    self.pending_acp_start = true;
                     self.auth = None;
                 } else {
                     // Login failed — show auth screen again
@@ -8760,6 +8803,7 @@ mod tests {
             debug_capture,
             true,
             false,
+            Arc::new(crate::shell::ShellManager::new()),
         )
     }
 
@@ -9166,6 +9210,7 @@ mod tests {
             debug_capture,
             true,
             false,
+            Arc::new(crate::shell::ShellManager::new()),
         );
         (app, master_rx)
     }
@@ -9397,6 +9442,7 @@ mod tests {
             debug_capture,
             true,
             false,
+            Arc::new(crate::shell::ShellManager::new()),
         );
 
         app.tab_id = Some("AAAA".to_string());
@@ -9454,6 +9500,7 @@ mod tests {
             debug_capture,
             true,
             false,
+            Arc::new(crate::shell::ShellManager::new()),
         );
 
         app.tab_id = Some("AAAA".to_string());
@@ -9543,6 +9590,7 @@ mod tests {
             debug_capture,
             true,
             false,
+            Arc::new(crate::shell::ShellManager::new()),
         );
         (app, load_session_rx)
     }

@@ -138,6 +138,18 @@ system.cancelled: "გაუქმებულია."
 system.no_prompt_in_flight: "მიმდინარე მოთხოვნა არ არის."
 system.authentication_failed: "ავთენტიფიკაცია ვერ მოხერხდა"
 system.command_copied_retry: "ბრძანება კოპირებულია — გაუშვით სხვა ტერმინალში, შემდეგ დააჭირეთ Enter ხელახლა საცდელად"  # {Locked="Enter"}
+system.agent_busy: "Agent ამ ჩანართზე დაკავებულია — დაელოდეთ მიმდინარე მოთხოვნის დასრულებას."
+system.resuming_session: "სესიის %{session_id} გაგრძელება..."
+system.unknown_command: "უცნობი ბრძანება \"%{command}\" — გაიგზავნა მოთხოვნად. სიისთვის აკრიფეთ /help."  # {Locked="/help"} — slash-command name.
+system.busy_use_stop: "დაელოდეთ მიმდინარე მოთხოვნის დასრულებას, ან ჯერ გამოიყენეთ /stop."  # {Locked="/stop"} — slash-command name.
+system.cannot_focus_session: "სესიაზე %{session_id} ფოკუსირება შეუძლებელია: ჩანს, რომ live არის, მაგრამ pane GUID ჯერ მიბმული არ არის. სცადეთ ცოტა ხანში."
+system.cannot_resume_no_load_session: "agent pane-ში გაგრძელება შეუძლებელია: %{agent}-მა ACP `loadSession` შესაძლებლობა არ გამოაცხადა. ამის ნაცვლად ახალ terminal pane-ში გასაგრძელებლად დააჭირეთ Enter-ს (Shift-ის გარეშე)."  # {Locked="ACP","loadSession","Enter","Shift"} — protocol/UI terms.
+system.cannot_resume_no_resume_flag: "%{agent} სესიის გაგრძელება შეუძლებელია: ამ agent-ს `--resume` სტილის flag არ აქვს. ამის ნაცვლად ACP-ის საშუალებით agent pane-ში გაგრძელების საცდელად დააჭირეთ Shift+Enter-ს."  # {Locked="--resume","Shift","Enter","ACP"} — flag and UI terms.
+system.cannot_resume_unknown_agent: "სესიის %{session_id} გაგრძელება შეუძლებელია: მისი წყარო agent უცნობია WTA-ის ამ build-ისთვის."
+system.cannot_resume_phantom_via_flag: "%{agent} სესიის %{session_id} გაგრძელება შეუძლებელია: ის დაიწყო, მაგრამ არცერთი საუბარი არ დაუგროვებია, ამიტომ %{agent} თვითონ უარყოფს გაგრძელებას. მწკრივის წაშლა."
+system.cannot_resume_phantom_via_load: "%{agent} სესიის %{session_id} გაგრძელება შეუძლებელია: ის დაიწყო, მაგრამ არცერთი საუბარი არ დაუგროვებია, ამიტომ %{agent} უარყოფს ჩატვირთვას. მწკრივის წაშლა."
+system.fallback.this_agent: "ეს agent"
+system.fallback.connected_agent: "დაკავშირებული agent"
 
 # ── CLI გამოსავალი რანტაიმში (src/main.rs) ────────────────────────────────────
 output.no_windows: "ფანჯრები ვერ მოიძებნა."
@@ -183,3 +195,6 @@ time.hour_singular: "1 საათის წინ"
 time.hours_other: "%{count} საათის წინ"
 time.day_singular: "1 დღის წინ"
 time.days_other: "%{count} დღის წინ"
+
+# ── რეკომენდაციის შესრულება (src/coordinator.rs) ───────────────────────────
+system.choice_execution_failed: "არჩევანი %{choice} ვერ შესრულდა: %{error}"

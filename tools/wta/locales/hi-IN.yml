@@ -138,6 +138,18 @@ system.cancelled: "रद्द किया गया।"
 system.no_prompt_in_flight: "कोई प्रॉम्प्ट प्रगति में नहीं है।"
 system.authentication_failed: "प्रमाणीकरण विफल"
 system.command_copied_retry: "कमांड कॉपी किया गया — इसे किसी अन्य टर्मिनल में चलाएँ, फिर पुनः प्रयास के लिए Enter दबाएँ"  # {Locked="Enter"}
+system.agent_busy: "इस टैब पर Agent व्यस्त है — वर्तमान प्रॉम्प्ट समाप्त होने तक प्रतीक्षा करें।"
+system.resuming_session: "सत्र %{session_id} फिर से शुरू किया जा रहा है..."
+system.unknown_command: "अज्ञात कमांड \"%{command}\" — प्रॉम्प्ट के रूप में भेजा गया। सूची के लिए /help लिखें।"  # {Locked="/help"} — slash-command name.
+system.busy_use_stop: "वर्तमान प्रॉम्प्ट समाप्त होने तक प्रतीक्षा करें, या पहले /stop करें।"  # {Locked="/stop"} — slash-command name.
+system.cannot_focus_session: "सत्र %{session_id} पर फ़ोकस नहीं किया जा सकता: यह live दिखता है लेकिन अभी तक कोई pane GUID बाउंड नहीं है। थोड़ी देर में फिर से कोशिश करें।"
+system.cannot_resume_no_load_session: "agent pane में फिर से शुरू नहीं किया जा सकता: %{agent} ने ACP `loadSession` क्षमता घोषित नहीं की। इसके बजाय नए terminal pane में फिर से शुरू करने के लिए Enter (Shift के बिना) दबाएँ।"  # {Locked="ACP","loadSession","Enter","Shift"} — protocol/UI terms.
+system.cannot_resume_no_resume_flag: "%{agent} सत्र फिर से शुरू नहीं किया जा सकता: इस agent में `--resume`-शैली का flag नहीं है। इसके बजाय ACP के माध्यम से agent pane के अंदर फिर से शुरू करने के लिए Shift+Enter दबाएँ।"  # {Locked="--resume","Shift","Enter","ACP"} — flag and UI terms.
+system.cannot_resume_unknown_agent: "सत्र %{session_id} फिर से शुरू नहीं किया जा सकता: इसका स्रोत agent इस WTA build के लिए अज्ञात है।"
+system.cannot_resume_phantom_via_flag: "%{agent} सत्र %{session_id} फिर से शुरू नहीं किया जा सकता: यह शुरू हुआ था लेकिन इसमें कोई बातचीत जमा नहीं हुई, इसलिए %{agent} स्वयं resume को अस्वीकार करेगा। पंक्ति हटाई जा रही है।"
+system.cannot_resume_phantom_via_load: "%{agent} सत्र %{session_id} फिर से शुरू नहीं किया जा सकता: यह शुरू हुआ था लेकिन इसमें कोई बातचीत जमा नहीं हुई, इसलिए %{agent} load को अस्वीकार करेगा। पंक्ति हटाई जा रही है।"
+system.fallback.this_agent: "यह agent"
+system.fallback.connected_agent: "कनेक्टेड agent"
 
 # ── रनटाइम CLI आउटपुट (src/main.rs) ────────────────────────────────────────
 output.no_windows: "कोई विंडो नहीं मिली।"
@@ -184,3 +196,6 @@ time.hour_singular: "%{count} घंटा पहले"
 time.hours_other: "%{count} घंटे पहले"
 time.day_singular: "%{count} दिन पहले"
 time.days_other: "%{count} दिन पहले"
+
+# ── अनुशंसा निष्पादन (src/coordinator.rs) ───────────────────────────
+system.choice_execution_failed: "चुनाव %{choice} विफल रहा: %{error}"

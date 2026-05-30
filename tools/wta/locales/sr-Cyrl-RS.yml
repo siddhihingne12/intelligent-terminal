@@ -134,6 +134,18 @@ system.cancelled: "Отказано."
 system.no_prompt_in_flight: "Нема активног захтева."
 system.authentication_failed: "Аутентификација није успела"
 system.command_copied_retry: "Команда је копирана — покрените је у другом терминалу, затим притисните Enter за поновни покушај"  # {Locked="Enter"}
+system.agent_busy: "Агент је заузет на овој картици — сачекајте да се тренутни упит заврши."
+system.resuming_session: "Наставља се сесија %{session_id}..."
+system.unknown_command: "Непозната команда \"%{command}\" — послата као упит. Унесите /help за списак."  # {Locked="/help"}
+system.busy_use_stop: "Сачекајте да се тренутни упит заврши или прво употребите /stop."  # {Locked="/stop"}
+system.cannot_focus_session: "Није могуће фокусирати сесију %{session_id}: изгледа активна, али још није повезан GUID окна. Покушајте поново за тренутак."
+system.cannot_resume_no_load_session: "Није могуће наставити у окну агента: %{agent} није огласио могућност ACP `loadSession`. Притисните Enter (без Shift) да уместо тога наставите у новом терминалском окну."  # {Locked="ACP","loadSession","Enter","Shift"}
+system.cannot_resume_no_resume_flag: "Није могуће наставити сесију агента %{agent}: овај агент нема заставицу у стилу `--resume`. Притисните Shift+Enter да покушате наставити унутар окна агента путем ACP-а."  # {Locked="--resume","Shift","Enter","ACP"}
+system.cannot_resume_unknown_agent: "Није могуће наставити сесију %{session_id}: њен изворни агент није познат овој верзији WTA."
+system.cannot_resume_phantom_via_flag: "Није могуће наставити сесију агента %{agent} %{session_id}: покренута је, али никада није прикупила разговор, па би сам %{agent} одбио наставак. Ред се уклања."
+system.cannot_resume_phantom_via_load: "Није могуће наставити сесију агента %{agent} %{session_id}: покренута је, али никада није прикупила разговор, па би %{agent} одбио учитавање. Ред се уклања."
+system.fallback.this_agent: "овај агент"
+system.fallback.connected_agent: "повезани агент"
 
 # ── Runtime CLI output (src/main.rs) ────────────────────────────────────────
 output.no_windows: "Нису пронађени прозори."
@@ -183,3 +195,6 @@ time.hour_singular: "пре 1 сат"
 time.hours_other: "пре %{count} сати"
 time.day_singular: "пре 1 дан"
 time.days_other: "пре %{count} дана"
+
+# ── Извршавање препоруке (src/coordinator.rs) ───────────────────────────────
+system.choice_execution_failed: "Избор %{choice} није успео: %{error}"

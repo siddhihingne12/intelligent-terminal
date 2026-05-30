@@ -127,6 +127,18 @@ system.cancelled: "Ακυρώθηκε."
 system.no_prompt_in_flight: "Δεν υπάρχει ενεργή εντολή."
 system.authentication_failed: "Ο έλεγχος ταυτότητας απέτυχε"
 system.command_copied_retry: "Η εντολή αντιγράφηκε — εκτελέστε την σε άλλο τερματικό, μετά πατήστε Enter για νέα δοκιμή"  # {Locked="Enter"}
+system.agent_busy: "Ο agent είναι απασχολημένος σε αυτήν την καρτέλα — περιμένετε να ολοκληρωθεί η τρέχουσα προτροπή."
+system.resuming_session: "Συνέχιση της περιόδου λειτουργίας %{session_id}..."
+system.unknown_command: "Άγνωστη εντολή \"%{command}\" — στάλθηκε ως προτροπή. Πληκτρολογήστε /help για τη λίστα."  # {Locked="/help"} — slash-command name.
+system.busy_use_stop: "Περιμένετε να ολοκληρωθεί η τρέχουσα προτροπή ή χρησιμοποιήστε πρώτα /stop."  # {Locked="/stop"} — slash-command name.
+system.cannot_focus_session: "Δεν είναι δυνατή η εστίαση στην περίοδο λειτουργίας %{session_id}: φαίνεται ενεργή, αλλά δεν έχει συνδεθεί ακόμα GUID τμήματος παραθύρου. Δοκιμάστε ξανά σε λίγο."
+system.cannot_resume_no_load_session: "Δεν είναι δυνατή η συνέχιση στο τμήμα παραθύρου agent: ο %{agent} δεν δήλωσε τη δυνατότητα ACP `loadSession`. Πατήστε Enter (χωρίς Shift) για συνέχιση σε νέο τμήμα παραθύρου τερματικού αντ' αυτού."  # {Locked="ACP","loadSession","Enter","Shift"} — protocol/UI terms.
+system.cannot_resume_no_resume_flag: "Δεν είναι δυνατή η συνέχιση της περιόδου λειτουργίας %{agent}: αυτός ο agent δεν έχει σημαία τύπου `--resume`. Πατήστε Shift+Enter για να δοκιμάσετε συνέχιση μέσα στο τμήμα παραθύρου agent μέσω ACP αντ' αυτού."  # {Locked="--resume","Shift","Enter","ACP"} — flag and UI terms.
+system.cannot_resume_unknown_agent: "Δεν είναι δυνατή η συνέχιση της περιόδου λειτουργίας %{session_id}: ο agent προέλευσης είναι άγνωστος σε αυτήν την έκδοση του WTA."
+system.cannot_resume_phantom_via_flag: "Δεν είναι δυνατή η συνέχιση της περιόδου λειτουργίας %{agent} %{session_id}: ξεκίνησε αλλά δεν συγκέντρωσε ποτέ καμία συνομιλία, επομένως ο ίδιος ο %{agent} θα απέρριπτε τη συνέχιση. Κατάργηση της γραμμής."
+system.cannot_resume_phantom_via_load: "Δεν είναι δυνατή η συνέχιση της περιόδου λειτουργίας %{agent} %{session_id}: ξεκίνησε αλλά δεν συγκέντρωσε ποτέ καμία συνομιλία, επομένως ο %{agent} θα απέρριπτε τη φόρτωση. Κατάργηση της γραμμής."
+system.fallback.this_agent: "αυτός ο agent"
+system.fallback.connected_agent: "ο συνδεδεμένος agent"
 
 # ── Runtime CLI output (src/main.rs) ────────────────────────────────────────
 output.no_windows: "Δεν βρέθηκαν παράθυρα."
@@ -172,3 +184,6 @@ time.hour_singular: "πριν από %{count} ώρα"
 time.hours_other: "πριν από %{count} ώρες"
 time.day_singular: "πριν από %{count} ημέρα"
 time.days_other: "πριν από %{count} ημέρες"
+
+# ── Εκτέλεση σύστασης (src/coordinator.rs) ───────────────────────────
+system.choice_execution_failed: "Η επιλογή %{choice} απέτυχε: %{error}"

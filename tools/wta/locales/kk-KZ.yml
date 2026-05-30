@@ -138,6 +138,18 @@ system.cancelled: "Бас тартылды."
 system.no_prompt_in_flight: "Орындалып жатқан сұрау жоқ."
 system.authentication_failed: "Аутентификация сәтсіз аяқталды"
 system.command_copied_retry: "Команда көшірілді — басқа терминалда іске қосыңыз, содан кейін қайталау үшін Enter басыңыз"  # {Locked="Enter"}
+system.agent_busy: "Агент осы қойыншада бос емес — ағымдағы сұрау аяқталғанын күтіңіз."
+system.resuming_session: "%{session_id} сеансы жалғастырылуда..."
+system.unknown_command: "Белгісіз пәрмен \"%{command}\" — сұрау ретінде жіберілді. Тізім үшін /help теріңіз."  # {Locked="/help"}
+system.busy_use_stop: "Ағымдағы сұрау аяқталғанын күтіңіз немесе алдымен /stop пайдаланыңыз."  # {Locked="/stop"}
+system.cannot_focus_session: "%{session_id} сеансына фокус қою мүмкін емес: ол белсенді сияқты, бірақ әлі ешбір панель GUID-і байланыстырылмаған. Сәлден кейін қайталап көріңіз."
+system.cannot_resume_no_load_session: "Агент панелінде жалғастыру мүмкін емес: %{agent} ACP `loadSession` мүмкіндігін жарияламады. Оның орнына жаңа терминал панелінде жалғастыру үшін Enter (Shift баспай) басыңыз."  # {Locked="ACP","loadSession","Enter","Shift"}
+system.cannot_resume_no_resume_flag: "%{agent} сеансын жалғастыру мүмкін емес: бұл агентте `--resume` үлгісіндегі жалауша жоқ. Оның орнына ACP арқылы агент панелінде жалғастырып көру үшін Shift+Enter басыңыз."  # {Locked="--resume","Shift","Enter","ACP"}
+system.cannot_resume_unknown_agent: "%{session_id} сеансын жалғастыру мүмкін емес: оның бастапқы агенті осы WTA құрастыруына белгісіз."
+system.cannot_resume_phantom_via_flag: "%{agent} %{session_id} сеансын жалғастыру мүмкін емес: ол басталған, бірақ ешқандай әңгіме жиналмаған, сондықтан %{agent} өзі жалғастыруды қабылдамайды. Жол жойылуда."
+system.cannot_resume_phantom_via_load: "%{agent} %{session_id} сеансын жалғастыру мүмкін емес: ол басталған, бірақ ешқандай әңгіме жиналмаған, сондықтан %{agent} жүктеуді қабылдамайды. Жол жойылуда."
+system.fallback.this_agent: "осы агент"
+system.fallback.connected_agent: "қосылған агент"
 
 # ── Runtime CLI output (src/main.rs) ────────────────────────────────────────
 output.no_windows: "Терезелер табылмады."
@@ -183,3 +195,6 @@ time.hour_singular: "%{count} сағат бұрын"
 time.hours_other: "%{count} сағат бұрын"
 time.day_singular: "%{count} күн бұрын"
 time.days_other: "%{count} күн бұрын"
+
+# ── Ұсынымды орындау (src/coordinator.rs) ───────────────────────────────────
+system.choice_execution_failed: "%{choice} таңдауы сәтсіз аяқталды: %{error}"

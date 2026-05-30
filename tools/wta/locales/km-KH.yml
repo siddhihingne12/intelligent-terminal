@@ -143,6 +143,18 @@ system.cancelled: "បានបោះបង់។"
 system.no_prompt_in_flight: "គ្មានសំណើកំពុងដំណើរការ។"
 system.authentication_failed: "ការផ្ទៀងផ្ទាត់បរាជ័យ"
 system.command_copied_retry: "ពាក្យបញ្ជាត្រូវបានចម្លង — ដំណើរការវានៅក្នុង terminal មួយទៀត រួចចុច Enter ដើម្បីសាកល្បង"  # {Locked="Enter"}
+system.agent_busy: "AI អេជេន្ត់កំពុងរវល់នៅលើផ្ទាំងនេះ — រង់ចាំឱ្យសំណើបច្ចុប្បន្នបញ្ចប់។"
+system.resuming_session: "កំពុងបន្តវគ្គ %{session_id}..."
+system.unknown_command: "មិនស្គាល់ពាក្យបញ្ជា \"%{command}\" — បានផ្ញើជាសំណើ។ វាយ /help ដើម្បីមើលបញ្ជី។"  # {Locked="/help"}
+system.busy_use_stop: "រង់ចាំឱ្យសំណើបច្ចុប្បន្នបញ្ចប់ ឬប្រើ /stop ជាមុន។"  # {Locked="/stop"}
+system.cannot_focus_session: "មិនអាចផ្តោតទៅលើវគ្គ %{session_id}: វាហាក់ដូចជាកំពុងដំណើរការ ប៉ុន្តែមិនទាន់បានភ្ជាប់ GUID របស់ផ្តាំងនៅឡើយទេ។ សូមសាកល្បងម្ដងទៀតបន្តិចទៀត។"
+system.cannot_resume_no_load_session: "មិនអាចបន្តនៅក្នុងផ្តាំងអេជេន្ត់បានទេ: %{agent} មិនបានប្រកាសសមត្ថភាព ACP `loadSession` ទេ។ ចុច Enter (ដោយមិនចុច Shift) ដើម្បីបន្តនៅក្នុងផ្តាំង terminal ថ្មីជំនួសវិញ។"  # {Locked="ACP","loadSession","Enter","Shift"}
+system.cannot_resume_no_resume_flag: "មិនអាចបន្តវគ្គ %{agent} បានទេ: អេជេន្ត់នេះមិនមាន flag រចនាប័ទ្ម `--resume` ទេ។ ចុច Shift+Enter ដើម្បីសាកល្បងបន្តនៅក្នុងផ្តាំងអេជេន្ត់តាម ACP ជំនួសវិញ។"  # {Locked="--resume","Shift","Enter","ACP"}
+system.cannot_resume_unknown_agent: "មិនអាចបន្តវគ្គ %{session_id} បានទេ: អេជេន្ត់ប្រភពរបស់វាមិនត្រូវបានស្គាល់ដោយ build នេះទេ។"
+system.cannot_resume_phantom_via_flag: "មិនអាចបន្តវគ្គ %{agent} %{session_id} បានទេ: វាត្រូវបានចាប់ផ្តើម ប៉ុន្តែមិនដែលមានការសន្ទនាណាមួយទេ ដូច្នេះ %{agent} ខ្លួនឯងនឹងបដិសេធការបន្ត។ កំពុងលុបជួរដេក។"
+system.cannot_resume_phantom_via_load: "មិនអាចបន្តវគ្គ %{agent} %{session_id} បានទេ: វាត្រូវបានចាប់ផ្តើម ប៉ុន្តែមិនដែលមានការសន្ទនាណាមួយទេ ដូច្នេះ %{agent} នឹងបដិសេធការផ្ទុក។ កំពុងលុបជួរដេក។"
+system.fallback.this_agent: "អេជេន្ត់នេះ"
+system.fallback.connected_agent: "អេជេន្ត់ដែលបានភ្ជាប់"
 
 # ── Runtime CLI output (src/main.rs) ──────────────────────────────────────────────────────────────────
 output.no_windows: "រកមិនឃើញបង្អូច។"
@@ -174,13 +186,11 @@ error.wtcli_wait_for_failed: "wtcli wait-for បរាជ័យ: %{stderr}"
 # {Locked="CLI","PATH","wt-agent-hooks","wta","wta hooks status","%LOCALAPPDATA%","IntelligentTerminal","wta-install-hooks.log"} - tool/CLI names, env vars, log file names
 hooks.bundle_source: "bundle source: %{source}%{path_suffix}"
 hooks.cli_not_on_path: "✗ CLI មិននៅលើ PATH"
-# Shown when a shell hook is successfully installed
 hooks.installed: "✓ បានតំឡើង"
 # Badge in hooks-status table when the extension install path is outdated
 hooks.marketplace_path_stale: "⚠ ផ្លូវ marketplace ហួសសម័យ"
 # Badge when the shell hook extension is installed but the user has disabled it
 hooks.installed_but_disabled: "⚠ បានតំឡើងប៉ុន្តែត្រូវបានបិទ"
-# Shown when a shell hook is not yet installed
 hooks.not_installed: "✗ មិនត្រូវបានតំឡើង"
 hooks.uninstall_skipped: "រំលង (CLI មិននៅលើ PATH)"
 hooks.install_attempted: "wt-agent-hooks install attempted (idempotent). Run `wta hooks status` to inspect the result. Trace log: %LOCALAPPDATA%\\IntelligentTerminal\\logs\\wta-install-hooks.log"
@@ -193,3 +203,6 @@ time.hour_singular: "%{count} ម៉ោងមុន"
 time.hours_other: "%{count} ម៉ោងមុន"
 time.day_singular: "%{count} ថ្ងៃមុន"
 time.days_other: "%{count} ថ្ងៃមុន"
+
+# ── ការអនុវត្តអនុសាសន៍ (src/coordinator.rs) ───────────────────────────
+system.choice_execution_failed: "ជម្រើស %{choice} បានបរាជ័យ: %{error}"

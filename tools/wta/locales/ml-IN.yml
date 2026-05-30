@@ -138,6 +138,18 @@ system.cancelled: "റദ്ദാക്കി."
 system.no_prompt_in_flight: "പുരോഗതിയില്‍ പ്രോംപ്റ്റ് ഇല്ല."
 system.authentication_failed: "പ്രമാണീകരണം പരാജയപ്പെട്ടു"
 system.command_copied_retry: "കമാന്‍ഡ് പകര്‍ത്തി — മറ്റൊരു ടെര്‍മിനലില്‍ അത് പ്രവര്‍ത്തിപ്പിക്കുക, എന്നിട്ട് വീണ്ടും ശ്രമിക്കാന്‍ Enter അമര്‍ത്തുക"  # {Locked="Enter"}
+system.agent_busy: "ഈ ടാബിൽ Agent തിരക്കിലാണ് — നിലവിലെ പ്രോംപ്റ്റ് പൂർത്തിയാകുന്നത് വരെ കാത്തിരിക്കുക."
+system.resuming_session: "സെഷൻ %{session_id} പുനരാരംഭിക്കുന്നു..."
+system.unknown_command: "അറിയാത്ത കമാൻഡ് \"%{command}\" — പ്രോംപ്റ്റായി അയച്ചു. പട്ടികയ്ക്കായി /help ടൈപ്പ് ചെയ്യുക."  # {Locked="/help"} — slash-command name.
+system.busy_use_stop: "നിലവിലെ പ്രോംപ്റ്റ് പൂർത്തിയാകുന്നത് വരെ കാത്തിരിക്കുക, അല്ലെങ്കിൽ ആദ്യം /stop ചെയ്യുക."  # {Locked="/stop"} — slash-command name.
+system.cannot_focus_session: "സെഷൻ %{session_id} ഫോക്കസ് ചെയ്യാനാകില്ല: അത് live ആയി തോന്നുന്നു, പക്ഷേ pane GUID ഇനിയും ബൗണ്ട് ചെയ്തിട്ടില്ല. കുറച്ച് കഴിഞ്ഞ് വീണ്ടും ശ്രമിക്കുക."
+system.cannot_resume_no_load_session: "agent pane-ൽ പുനരാരംഭിക്കാൻ കഴിയില്ല: %{agent} ACP `loadSession` കഴിവ് പ്രഖ്യാപിച്ചിട്ടില്ല. പകരം പുതിയ terminal pane-ൽ പുനരാരംഭിക്കാൻ Enter (Shift ഇല്ലാതെ) അമർത്തുക."  # {Locked="ACP","loadSession","Enter","Shift"} — protocol/UI terms.
+system.cannot_resume_no_resume_flag: "%{agent} സെഷൻ പുനരാരംഭിക്കാൻ കഴിയില്ല: ഈ agent-ന് `--resume` ശൈലിയിലുള്ള flag ഇല്ല. പകരം ACP വഴി agent pane-നുള്ളിൽ പുനരാരംഭിക്കാൻ Shift+Enter അമർത്തി ശ്രമിക്കുക."  # {Locked="--resume","Shift","Enter","ACP"} — flag and UI terms.
+system.cannot_resume_unknown_agent: "സെഷൻ %{session_id} പുനരാരംഭിക്കാൻ കഴിയില്ല: ഇതിന്റെ ഉറവിട agent ഈ WTA build-ന് അറിയില്ല."
+system.cannot_resume_phantom_via_flag: "%{agent} സെഷൻ %{session_id} പുനരാരംഭിക്കാൻ കഴിയില്ല: അത് തുടങ്ങിയിരുന്നു, പക്ഷേ ഒരു സംഭാഷണവും ശേഖരിച്ചിട്ടില്ല; അതിനാൽ %{agent} തന്നെ resume നിരസിക്കും. വരി നീക്കം ചെയ്യുന്നു."
+system.cannot_resume_phantom_via_load: "%{agent} സെഷൻ %{session_id} പുനരാരംഭിക്കാൻ കഴിയില്ല: അത് തുടങ്ങിയിരുന്നു, പക്ഷേ ഒരു സംഭാഷണവും ശേഖരിച്ചിട്ടില്ല; അതിനാൽ %{agent} load നിരസിക്കും. വരി നീക്കം ചെയ്യുന്നു."
+system.fallback.this_agent: "ഈ agent"
+system.fallback.connected_agent: "കണക്റ്റുചെയ്‌ത agent"
 
 # ── റണ്‍ടൈം CLI ഔട്ട്പുട്ട് (src/main.rs) ────────────────────────────────────────
 output.no_windows: "വിന്‍ഡോകള്‍ കണ്ടെത്തിയില്ല."
@@ -184,3 +196,6 @@ time.hour_singular: "%{count} മണിക്കൂർ മുമ്പ്"
 time.hours_other: "%{count} മണിക്കൂർ മുമ്പ്"
 time.day_singular: "%{count} ദിവസം മുമ്പ്"
 time.days_other: "%{count} ദിവസങ്ങൾ മുമ്പ്"
+
+# ── ശുപാർശ നടപ്പാക്കൽ (src/coordinator.rs) ───────────────────────────
+system.choice_execution_failed: "തിരഞ്ഞെടുപ്പ് %{choice} പരാജയപ്പെട്ടു: %{error}"

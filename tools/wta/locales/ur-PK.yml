@@ -138,6 +138,18 @@ system.cancelled: "منسوخ کیا گیا۔"
 system.no_prompt_in_flight: "کوئی پرامپٹ زیر عمل نہیں ہے۔"
 system.authentication_failed: "تصدیق ناکام"
 system.command_copied_retry: "کمانڈ کاپی ہو گئی — اسے دوسرے ٹرمینل میں چلائیں، پھر دوبارہ کوشش کے لیے Enter دبائیں"  # {Locked="Enter"}
+system.agent_busy: "اس ٹیب پر Agent مصروف ہے — موجودہ پرامپٹ ختم ہونے تک انتظار کریں۔"
+system.resuming_session: "سیشن %{session_id} دوبارہ شروع کیا جا رہا ہے..."
+system.unknown_command: "نامعلوم کمانڈ \"%{command}\" — پرامپٹ کے طور پر بھیجی گئی۔ فہرست کے لیے /help ٹائپ کریں۔"  # {Locked="/help"} — slash-command name.
+system.busy_use_stop: "موجودہ پرامپٹ ختم ہونے تک انتظار کریں، یا پہلے /stop کریں۔"  # {Locked="/stop"} — slash-command name.
+system.cannot_focus_session: "سیشن %{session_id} پر فوکس نہیں کیا جا سکتا: یہ live لگتا ہے مگر ابھی کوئی pane GUID باؤنڈ نہیں ہے۔ کچھ دیر بعد دوبارہ کوشش کریں۔"
+system.cannot_resume_no_load_session: "agent pane میں دوبارہ شروع نہیں کیا جا سکتا: %{agent} نے ACP `loadSession` صلاحیت کا اعلان نہیں کیا۔ اس کے بجائے نئے terminal pane میں دوبارہ شروع کرنے کے لیے Enter (Shift کے بغیر) دبائیں۔"  # {Locked="ACP","loadSession","Enter","Shift"} — protocol/UI terms.
+system.cannot_resume_no_resume_flag: "%{agent} سیشن دوبارہ شروع نہیں کیا جا سکتا: اس agent کے پاس `--resume` طرز کا flag نہیں ہے۔ اس کے بجائے ACP کے ذریعے agent pane کے اندر دوبارہ شروع کرنے کی کوشش کے لیے Shift+Enter دبائیں۔"  # {Locked="--resume","Shift","Enter","ACP"} — flag and UI terms.
+system.cannot_resume_unknown_agent: "سیشن %{session_id} دوبارہ شروع نہیں کیا جا سکتا: اس کا ماخذ agent اس WTA build کے لیے نامعلوم ہے۔"
+system.cannot_resume_phantom_via_flag: "%{agent} سیشن %{session_id} دوبارہ شروع نہیں کیا جا سکتا: یہ شروع ہوا تھا مگر اس میں کوئی گفتگو جمع نہیں ہوئی، اس لیے %{agent} خود resume کو مسترد کر دے گا۔ قطار ہٹائی جا رہی ہے۔"
+system.cannot_resume_phantom_via_load: "%{agent} سیشن %{session_id} دوبارہ شروع نہیں کیا جا سکتا: یہ شروع ہوا تھا مگر اس میں کوئی گفتگو جمع نہیں ہوئی، اس لیے %{agent} load کو مسترد کر دے گا۔ قطار ہٹائی جا رہی ہے۔"
+system.fallback.this_agent: "یہ agent"
+system.fallback.connected_agent: "منسلک agent"
 
 # ── رن ٹائم CLI آؤٹ پٹ (src/main.rs) ────────────────────────────────────────
 output.no_windows: "کوئی ونڈو نہیں ملی۔"
@@ -184,3 +196,6 @@ time.hour_singular: "%{count} گھنٹہ پہلے"
 time.hours_other: "%{count} گھنٹے پہلے"
 time.day_singular: "%{count} دن پہلے"
 time.days_other: "%{count} دن پہلے"
+
+# ── سفارش پر عمل درآمد (src/coordinator.rs) ───────────────────────────
+system.choice_execution_failed: "انتخاب %{choice} ناکام ہو گیا: %{error}"

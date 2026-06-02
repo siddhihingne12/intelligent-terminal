@@ -188,6 +188,7 @@ USEROBJECTFLAGS
 Vcpp
 Viewbox
 virtualalloc
+wcsnicmp
 wcsnlen
 WDJ
 winhttp

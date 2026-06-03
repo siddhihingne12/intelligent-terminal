@@ -1081,6 +1081,66 @@ async fn resolve_active_pane_cwd(
         .map(std::path::PathBuf::from)
 }
 
+/// Best-effort canonical shell executable for a pid — e.g. `pwsh.exe`,
+/// `powershell.exe`, `cmd.exe`, `bash.exe`, `wsl.exe`. Unlike the WT profile
+/// *name* (which the user can rename), this is the actual running process, so
+/// the agent can reliably pick shell syntax. Returns the file name only;
+/// `None` on any failure (or off Windows).
+#[cfg(windows)]
+fn process_image_name(pid: u32) -> Option<String> {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid == 0 {
+        return None;
+    }
+    // SAFETY: a standard Win32 handle dance. The handle from OpenProcess is
+    // closed on every return path; the buffer is sized up front and the
+    // written length comes back in `size`.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return None;
+        }
+        // Not MAX_PATH: QueryFullProcessImageNameW can return paths longer than
+        // 260 for processes under long roots (WindowsApps installs, `\\?\`
+        // extended paths). Use the extended-length max so a valid pid never
+        // silently drops the `shell` field. Heap-allocated to keep it off the
+        // (smaller) task stack.
+        let mut size: u32 = 32768;
+        let mut buf = vec![0u16; size as usize];
+        let ok =
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut size);
+        CloseHandle(handle);
+        if ok == 0 || size == 0 {
+            return None;
+        }
+        let full = String::from_utf16_lossy(&buf[..size as usize]);
+        full.rsplit(['\\', '/'])
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+}
+
+#[cfg(not(windows))]
+fn process_image_name(_pid: u32) -> Option<String> {
+    None
+}
+
+/// Resolve the canonical shell exe from an active-pane JSON object's `pid`
+/// field (already present in `get_active_pane`/`get_panes` responses). The
+/// agent gets this as the `shell` field — the sole shell-type signal, since
+/// the WT profile *name* (which the user can rename) is no longer shipped.
+fn shell_from_active(active: &serde_json::Value) -> Option<String> {
+    active
+        .get("pid")
+        .and_then(|v| v.as_u64())
+        .and_then(|pid| process_image_name(pid as u32))
+}
+
 async fn build_terminal_context_json(shell_mgr: &ShellManager) -> Option<String> {
     // WT's GetActivePane already resolves the agent pane to the user's working
     // pane (the "source"), so a single active-pane query gives us the right
@@ -1106,22 +1166,17 @@ async fn build_terminal_context_json(shell_mgr: &ShellManager) -> Option<String>
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string());
-    // Shell profile (e.g. "PowerShell", "Command Prompt", "Ubuntu") is
-    // load-bearing for the planner: any `send` action it emits has to
-    // match the active pane's shell syntax (`Get-ChildItem` vs `ls`,
-    // `Set-Location` vs `cd`, etc.). Without this the agent has to
-    // guess from the buffer's prompt prefix, which silently fails on
-    // renamed or unusual profiles.
-    let target_profile = active
-        .get("profile")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string());
+    // Canonical shell exe (pwsh.exe / cmd.exe / wsl.exe …) from the pane's pid.
+    // Load-bearing for the planner: any `send` action it emits has to match the
+    // active pane's shell syntax (`Get-ChildItem` vs `ls`, `Set-Location` vs
+    // `cd`, etc.). We use the real process rather than the WT profile name,
+    // which the user can rename.
+    let target_shell = shell_from_active(&active);
 
     tracing::debug!(
         target: "acp.terminal_context",
         target_pane_id = %target_pane_id,
-        profile = ?target_profile,
+        shell = ?target_shell,
         "terminal_context_target_resolved"
     );
 
@@ -1137,7 +1192,7 @@ async fn build_terminal_context_json(shell_mgr: &ShellManager) -> Option<String>
         "activeTarget": target_pane_id,
         "window_title": target_window_title,
         "cwd": target_cwd,
-        "profile": target_profile,
+        "shell": target_shell,
         "locale": user_locale_tag(),
         "buffer": buffer,
     }))
@@ -1165,9 +1220,14 @@ async fn build_prompt_text(
     shell_mgr: &ShellManager,
     wt_connected: bool,
     pane_context: Option<&PaneContext>,
-) -> (String, String, String) {
+) -> (String, String, String, Option<String>) {
     let total_started = std::time::Instant::now();
     let mut runtime_sections = Vec::new();
+    // Working pane resolved from the active pane for a manual `/fix` (one with
+    // no explicit `source_pane_id`). Plumbed back to the App so it can fill
+    // `AutofixContext.target_pane_id` — empty otherwise (auto-fix carries its
+    // failing pane explicitly; planner turns let the agent fill `Send.parent`).
+    let mut resolved_fix_pane: Option<String> = None;
 
     let template_started = std::time::Instant::now();
     let planner_template = if is_autofix {
@@ -1235,42 +1295,71 @@ async fn build_prompt_text(
         // header so the agent can choose PowerShell vs bash vs cmd syntax for
         // any file-edit fix it suggests.
         if wt_connected {
-            if let Some(source_pane_id) =
-                pane_context.and_then(|ctx| ctx.effective_source_pane_id())
-            {
+            // Resolve the active pane once: it supplies the shell-context
+            // header and — for a manual `/fix`, which carries no explicit
+            // `source_pane_id` — doubles as the source-pane resolver. WT's
+            // GetActivePane already maps the agent pane to the user's working
+            // pane, so this is the same target the error-triggered path gets
+            // from its notification.
+            let active = shell_mgr.wt_get_active_pane().await.ok();
+
+            // Shell context — best-effort. The canonical shell exe (from the
+            // pane's pid) tells the agent which syntax the fix command must use.
+            if let Some(active) = active.as_ref() {
+                let cwd = active
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Canonical shell exe from the pane's pid — see `shell_from_active`.
+                let shell = shell_from_active(active);
+                let json = serde_json::to_string(&serde_json::json!({
+                    "shell": shell,
+                    "cwd": cwd,
+                    "locale": user_locale_tag(),
+                }))
+                .unwrap_or_else(|_| "{}".to_string());
+                runtime_sections.push(format!("### Shell Context\n```json\n{}\n```", json));
+            }
+
+            // Explicit source pane (error-triggered autofix) wins; otherwise
+            // fall back to the resolved active working pane (`/fix`). An
+            // active pane that is itself an agent pane is skipped — there's
+            // no terminal output to read there.
+            let explicit_source = pane_context.and_then(|ctx| ctx.source_pane_id.clone());
+            let source_pane_id = explicit_source.clone().or_else(|| {
+                active.as_ref().and_then(|a| {
+                    let is_agent = a
+                        .get("is_agent_pane")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if is_agent {
+                        None
+                    } else {
+                        json_str_or_num(a.get("session_id"))
+                    }
+                })
+            });
+            // When we resolved the pane ourselves (manual `/fix`, no explicit
+            // source), remember it so the App can fill `target_pane_id` — that
+            // is the pane the eventual fix command is sent to.
+            if explicit_source.is_none() {
+                resolved_fix_pane = source_pane_id.clone();
+            }
+
+            if let Some(source_pane_id) = source_pane_id {
                 tracing::debug!(
                     target: "acp.terminal_context",
-                    source_pane_id,
+                    source_pane_id = %source_pane_id,
+                    // The shell type shipped in `### Shell Context` above; log it
+                    // here too so a `/fix` run shows what the agent received.
+                    shell = ?active.as_ref().and_then(shell_from_active),
                     mode = "autofix",
                     "terminal_context_target_resolved"
                 );
-
-                // Shell context — best-effort. WT returns the profile name
-                // (e.g. "PowerShell", "Command Prompt", "Ubuntu") which is a
-                // strong signal even when the user has renamed the profile.
-                if let Ok(active) = shell_mgr.wt_get_active_pane().await {
-                    let profile = active
-                        .get("profile")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let cwd = active
-                        .get("cwd")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let json = serde_json::to_string(&serde_json::json!({
-                        "profile": profile,
-                        "cwd": cwd,
-                        "locale": user_locale_tag(),
-                    }))
-                    .unwrap_or_else(|_| "{}".to_string());
-                    runtime_sections.push(format!("### Shell Context\n```json\n{}\n```", json));
-                }
-
                 if let Some(content) = read_pane_last_message(
                     shell_mgr,
-                    source_pane_id,
+                    &source_pane_id,
                     30,
                     ACTIVE_PANE_CONTEXT_MAX_CHARS,
                 )
@@ -1299,7 +1388,15 @@ async fn build_prompt_text(
             .join("\n\n")
     };
     let prompt = if is_autofix {
-        prompt_body
+        // Autofix prompts historically ignored `user_text` — the template +
+        // terminal output was the whole prompt. Now a non-empty `user_text` is
+        // appended as a `## User Request`: a manual `/fix <hint>` passes the
+        // hint here, and the error-triggered path passes its failure summary.
+        if user_text.trim().is_empty() {
+            prompt_body
+        } else {
+            format!("{}\n\n## User Request\n{}", prompt_body, user_text)
+        }
     } else if prompt_body.is_empty() {
         format!("## User Request\n{}", user_text)
     } else {
@@ -1321,6 +1418,7 @@ async fn build_prompt_text(
         prompt,
         planner_template.source_label,
         planner_template.display_name,
+        resolved_fix_pane,
     )
 }
 
@@ -4033,7 +4131,7 @@ async fn dispatch_prompt_body(
         .await;
 
     prompt_timing_task.activate(&prompt_session_id_str, &prompt);
-    let (text, prompt_source, prompt_name) = build_prompt_text(
+    let (text, prompt_source, prompt_name, resolved_fix_pane) = build_prompt_text(
         prompt.id,
         prompt.submitted_at_unix_s,
         &prompt.text,
@@ -4044,6 +4142,19 @@ async fn dispatch_prompt_body(
         prompt.pane_context.as_ref(),
     )
     .await;
+    // A manual `/fix` resolved its working pane in build_prompt_text (it had no
+    // explicit source pane). Plumb it back so the App fills the turn's
+    // `target_pane_id`; the host fills `Send.parent` from it at execute time.
+    if let Some(pane_id) = resolved_fix_pane {
+        let _ = event_tx_task.send(AppEvent::AutofixTargetResolved {
+            tab_id: prompt
+                .pane_context
+                .as_ref()
+                .and_then(|c| c.tab_id.clone()),
+            prompt_id: prompt.id,
+            pane_id,
+        });
+    }
     let _ = event_tx_task.send(AppEvent::PromptTemplateLoaded { name: prompt_name });
     prompt_timing_task.mark_context_ready(&prompt_session_id_str, text.len());
     acp_log_built_prompt(
@@ -4144,12 +4255,29 @@ async fn dispatch_prompt_body(
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_prompt_request, inject_wta_pane_meta, requested_model_id,
+        complete_prompt_request, inject_wta_pane_meta, requested_model_id, shell_from_active,
         summarize_agent_identity, user_locale_tag, PromptTimingState, SoftStopReason,
     };
     use super::acp;
     use crate::app::AppEvent;
     use tokio::sync::mpsc;
+
+    /// `shell_from_active` resolves our own pid to a real exe name (the test
+    /// binary). Proves the pid → image-name path works end to end on Windows;
+    /// a missing/zero pid yields `None`.
+    #[cfg(windows)]
+    #[test]
+    fn shell_from_active_resolves_pid() {
+        let me = serde_json::json!({ "pid": std::process::id() });
+        let name = shell_from_active(&me).expect("own pid should resolve");
+        assert!(
+            name.to_ascii_lowercase().ends_with(".exe"),
+            "expected an .exe image name, got {name:?}"
+        );
+
+        assert_eq!(shell_from_active(&serde_json::json!({ "pid": 0 })), None);
+        assert_eq!(shell_from_active(&serde_json::json!({})), None);
+    }
 
     /// Helper-only: round-trip a `_meta` blob through `inject_wta_pane_meta`
     /// and report the `pane_session_id` that the master would see in

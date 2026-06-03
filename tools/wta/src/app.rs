@@ -1085,6 +1085,16 @@ pub enum AppEvent {
     PromptTemplateLoaded {
         name: String,
     },
+    /// The working pane a manual `/fix` resolved to, plumbed back from the ACP
+    /// client task so the App can fill `AutofixContext.target_pane_id` on the
+    /// in-flight turn. The host fills `Send.parent` from it at execute time —
+    /// the agent never echoes a pane id for autofix turns. Routed by
+    /// `prompt_id` so a superseded turn (a newer `/fix`) is left untouched.
+    AutofixTargetResolved {
+        tab_id: Option<String>,
+        prompt_id: u64,
+        pane_id: String,
+    },
     /// Errors raised before a session exists carry None for `session_id`
     /// and route to the active tab; in-flight failures route to the
     /// session's tab. `failure` is the typed classification that drives
@@ -3919,6 +3929,7 @@ impl App {
             AppEvent::TabError { .. } => "tab_error",
             AppEvent::TabSystemMessage { .. } => "tab_system_message",
             AppEvent::PromptTemplateLoaded { .. } => "prompt_template_loaded",
+            AppEvent::AutofixTargetResolved { .. } => "autofix_target_resolved",
             AppEvent::AgentError { .. } => "agent_error",
             AppEvent::AgentSoftStop { .. } => "agent_soft_stop",
             AppEvent::AgentBusy { .. } => "agent_busy",
@@ -4158,6 +4169,13 @@ impl App {
             }
             AppEvent::PromptTemplateLoaded { name } => {
                 self.prompt_name = Some(name);
+            }
+            AppEvent::AutofixTargetResolved {
+                tab_id,
+                prompt_id,
+                pane_id,
+            } => {
+                self.apply_autofix_target_resolved(tab_id, prompt_id, pane_id);
             }
             AppEvent::AgentBusy { tab_id } => {
                 let tab = self.tab_mut(&tab_id);
@@ -6560,6 +6578,7 @@ impl App {
             CommandKind::Clear => self.cmd_clear(),
             CommandKind::Stop => self.cmd_stop(in_flight),
             CommandKind::New => self.cmd_new(in_flight),
+            CommandKind::Fix => self.cmd_fix(in_flight, cmd.rest),
             CommandKind::Sessions => self.cmd_sessions(),
             CommandKind::Restart => self.cmd_restart(),
         }
@@ -6628,6 +6647,126 @@ impl App {
         tab.selected_completed_turn_idx = None;
         tab.session_id = None;
         tab.scroll_to_bottom();
+    }
+
+    /// `/fix [hint]` — run the auto-fix prompt on demand against the active
+    /// terminal pane. Reuses the error-triggered autofix pipeline
+    /// (`PromptSubmission::is_autofix`): the agent receives the `auto-fix.md`
+    /// template plus the working pane's recent output, and any `hint` typed
+    /// after `/fix` is appended as an extra steer.
+    ///
+    /// Differences from auto-triggered autofix (`maybe_trigger_autofix`):
+    /// there is no failing-pane notification, so (1) the source pane is
+    /// resolved in the ACP client task — `PaneContext.source_pane_id` is left
+    /// `None` and `build_prompt_text` falls back to WT's active pane, which
+    /// GetActivePane maps from the agent pane to the user's working pane; and
+    /// (2) `target_pane_id` starts empty and is late-bound once the client task
+    /// resolves that working pane (`AppEvent::AutofixTargetResolved` →
+    /// `apply_autofix_target_resolved`), so `turn_execute_card` fills
+    /// `Send.parent` with a real pane. The bottom-bar Pending pill is *not*
+    /// armed — that UI is tied to a specific failing pane, and a command typed
+    /// into the agent pane surfaces its result there directly.
+    ///
+    /// Refuses while a turn is in flight; the user should `/stop` first.
+    fn cmd_fix(&mut self, in_flight: bool, hint: String) {
+        if in_flight {
+            let tab = self.current_tab_mut();
+            tab.messages
+                .push(ChatMessage::System(t!("system.busy_use_stop").into_owned()));
+            tab.scroll_to_bottom();
+            return;
+        }
+
+        let target_tab_id = self
+            .tab_id
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TAB_ID.to_string());
+
+        // Bump generation so any stale in-flight autofix response is dropped,
+        // and clear a leftover suggestion — mirrors `maybe_trigger_autofix`.
+        let generation = {
+            let tab = self.tab_mut(&target_tab_id);
+            tab.autofix.generation = tab.autofix.generation.wrapping_add(1);
+            tab.autofix.suggested_pane_id = None;
+            tab.autofix.generation
+        };
+
+        let pane_context = PaneContext {
+            pane_id: self.pane_id.clone(),
+            tab_id: Some(target_tab_id.clone()),
+            window_id: self.window_id.clone(),
+            cwd: None,
+            // None → the client task resolves the active working pane itself.
+            source_pane_id: None,
+        };
+
+        let hint = hint.trim().to_string();
+        let prompt = PromptSubmission::new_autofix(hint.clone(), Some(pane_context));
+        let submitted = SubmittedPrompt {
+            id: prompt.id,
+            text: prompt.text.clone(),
+            submitted_at_unix_s: prompt.submitted_at_unix_s,
+            autofix: Some(AutofixContext {
+                // Placeholder — the working pane isn't known synchronously here.
+                // The ACP client task resolves it and `apply_autofix_target_resolved`
+                // late-binds it (matched by prompt id) before the card surfaces,
+                // so `turn_execute_card` fills `Send.parent` with a real pane.
+                target_pane_id: String::new(),
+                generation,
+            }),
+        };
+        tracing::info!(
+            target: "slash_cmd",
+            tab_id = %target_tab_id,
+            generation,
+            has_hint = !hint.is_empty(),
+            "dispatching /fix",
+        );
+        self.turn_submit_prompt_for_tab(&target_tab_id, submitted);
+        let _ = self.prompt_tx.send(prompt);
+    }
+
+    /// Late-bind a manual `/fix`'s target pane. The working pane is resolved
+    /// in the ACP client task (it isn't known when `cmd_fix` submits) and
+    /// plumbed back via [`AppEvent::AutofixTargetResolved`]. We patch the
+    /// matching in-flight turn's `AutofixContext.target_pane_id` so that
+    /// `turn_execute_card` fills `Send.parent` with a real pane — without it,
+    /// the host's send has no destination ("SendInput failed: no parent").
+    ///
+    /// Routed by `prompt_id`: a superseded turn (the user fired a newer `/fix`)
+    /// won't match, so a stale resolution is dropped. The event is emitted
+    /// before the agent responds, so the patch lands while the turn is still
+    /// `Submitted` — well before the fix card surfaces or the user executes it.
+    fn apply_autofix_target_resolved(
+        &mut self,
+        tab_id: Option<String>,
+        prompt_id: u64,
+        pane_id: String,
+    ) {
+        if pane_id.is_empty() {
+            return;
+        }
+        let key = tab_id.unwrap_or_else(|| self.active_tab_key().to_string());
+        let Some(tab) = self.tab_sessions.get_mut(&key) else {
+            return;
+        };
+        let Some(prompt) = tab.turn.prompt_mut() else {
+            return;
+        };
+        if prompt.id != prompt_id {
+            return;
+        }
+        let Some(autofix) = prompt.autofix.as_mut() else {
+            return;
+        };
+        autofix.target_pane_id = pane_id.clone();
+        tracing::info!(
+            target: "slash_cmd",
+            tab = %key,
+            prompt_id,
+            pane = %pane_id,
+            "bound /fix target pane",
+        );
     }
 
     /// `/sessions` — open the Agents picker for the active tab.
@@ -7509,7 +7648,13 @@ impl App {
         let target_tab = self.tab_for_session(session_id);
         let tab = self.session_tab_mut(session_id);
         let prompt = tab.turn.prompt().cloned().expect("prompt set");
-        let autofix_pane = prompt.autofix.as_ref().map(|a| a.target_pane_id.clone());
+        // Empty `target_pane_id` (manual `/fix`) is not a real pane — filter
+        // it out so an empty-response turn doesn't emit a bottom-bar event.
+        let autofix_pane = prompt
+            .autofix
+            .as_ref()
+            .map(|a| a.target_pane_id.clone())
+            .filter(|s| !s.is_empty());
         tab.turn = TurnState::Surfaced {
             prompt,
             outcome: TurnOutcome::Empty,
@@ -7894,20 +8039,26 @@ impl App {
         recommendations: RecommendationSet,
         phase_name: &str,
     ) {
-        let pane_id = self
+        let target_pane_id = self
             .session_tab(session_id)
             .turn
             .prompt()
             .and_then(|p| p.autofix.as_ref())
             .map(|a| a.target_pane_id.clone());
-        let Some(pane_id) = pane_id else {
+        // Defensive: only autofix turns surface a fix card here.
+        let Some(target_pane_id) = target_pane_id else {
             return;
         };
+        // An empty `target_pane_id` is a manually-invoked `/fix` with no
+        // concrete failing pane. Still surface the card below, but skip the
+        // bottom-bar / suggested-pane side effects — they key off a real
+        // failing pane (the Review pill, the Ctrl+Alt+. hotkey target).
+        let bar_pane = (!target_pane_id.is_empty()).then_some(target_pane_id);
         self.log_selection_phase_for(
             session_id,
             phase_name,
             &format!(
-                "pane={pane_id} title={:?}",
+                "pane={bar_pane:?} title={:?}",
                 recommendations.choices.first().map(|c| &c.title)
             ),
         );
@@ -7917,13 +8068,15 @@ impl App {
         // pane is closed, Idle when it's already open). The recommendation
         // card still lives in the turn below so the user can act on it
         // inside the pane — autofix no longer auto-executes.
-        {
-            let autofix = &mut self.tab_mut(&target_tab).autofix;
-            autofix.suggested_pane_id = Some(pane_id.clone());
-            autofix.pane_id = None;
-            autofix.armed_at = None;
+        if let Some(pane_id) = bar_pane.as_ref() {
+            {
+                let autofix = &mut self.tab_mut(&target_tab).autofix;
+                autofix.suggested_pane_id = Some(pane_id.clone());
+                autofix.pane_id = None;
+                autofix.armed_at = None;
+            }
+            self.emit_autofix_state_result(&target_tab, pane_id);
         }
-        self.emit_autofix_state_result(&target_tab, &pane_id);
         let rec_idx = recommended_choice_index(&recommendations);
         let summary = format_recommendations_for_chat(&recommendations);
         let turn_prompt_label = t!("chat.autofix_prompt_label").into_owned();
@@ -7965,20 +8118,25 @@ impl App {
         explanation: String,
         phase_name: &str,
     ) {
-        let pane_id = self
+        let target_pane_id = self
             .session_tab(session_id)
             .turn
             .prompt()
             .and_then(|p| p.autofix.as_ref())
             .map(|a| a.target_pane_id.clone());
-        let Some(pane_id) = pane_id else {
+        // Defensive: only autofix turns surface an explain answer here.
+        let Some(target_pane_id) = target_pane_id else {
             return;
         };
+        // Empty `target_pane_id` = a manually-invoked `/fix` with no concrete
+        // failing pane: surface the explanation, but skip the bottom-bar /
+        // suggested-pane side effects below.
+        let bar_pane = (!target_pane_id.is_empty()).then_some(target_pane_id);
         self.log_selection_phase_for(
             session_id,
             phase_name,
             &format!(
-                "pane={pane_id} title={title:?} chars={}",
+                "pane={bar_pane:?} title={title:?} chars={}",
                 explanation.chars().count()
             ),
         );
@@ -8007,13 +8165,15 @@ impl App {
         // Explanation lives in the chat above; mark the tab as having a
         // result pending review and surface the bar (Review when the pane
         // is closed, Idle when already open).
-        {
-            let tab = self.session_tab_mut(session_id);
-            tab.autofix.suggested_pane_id = Some(pane_id.clone());
-            tab.autofix.pane_id = None;
-            tab.autofix.armed_at = None;
+        if let Some(pane_id) = bar_pane.as_ref() {
+            {
+                let tab = self.session_tab_mut(session_id);
+                tab.autofix.suggested_pane_id = Some(pane_id.clone());
+                tab.autofix.pane_id = None;
+                tab.autofix.armed_at = None;
+            }
+            self.emit_autofix_state_result(&target_tab, pane_id);
         }
-        self.emit_autofix_state_result(&target_tab, &pane_id);
 
         let tab = self.session_tab_mut(session_id);
         let prompt = tab.turn.prompt().cloned().expect("prompt set");
@@ -12317,6 +12477,58 @@ mod tests {
             }),
         };
         app.turn_submit_prompt(DEFAULT_TAB_ID, prompt);
+    }
+
+    /// Submit a manual-`/fix`-style autofix turn: an autofix context whose
+    /// `target_pane_id` is empty (the App doesn't know the working pane until
+    /// the client task resolves it and plumbs it back).
+    fn submit_fix_prompt(app: &mut App, id: u64) {
+        let gen = {
+            let tab = app.tab_mut(DEFAULT_TAB_ID);
+            tab.autofix.generation = tab.autofix.generation.wrapping_add(1);
+            tab.autofix.generation
+        };
+        let prompt = SubmittedPrompt {
+            id,
+            text: String::new(),
+            submitted_at_unix_s: 0.0,
+            autofix: Some(AutofixContext {
+                target_pane_id: String::new(),
+                generation: gen,
+            }),
+        };
+        app.turn_submit_prompt(DEFAULT_TAB_ID, prompt);
+    }
+
+    fn fix_target_pane(app: &App) -> String {
+        app.current_tab()
+            .turn
+            .prompt()
+            .unwrap()
+            .autofix
+            .as_ref()
+            .unwrap()
+            .target_pane_id
+            .clone()
+    }
+
+    #[test]
+    fn fix_target_pane_is_late_bound_by_prompt_id() {
+        let mut app = test_app();
+        submit_fix_prompt(&mut app, 42);
+        assert_eq!(fix_target_pane(&app), "", "starts unbound");
+
+        // A resolution for a different prompt id (a superseded /fix) is ignored.
+        app.apply_autofix_target_resolved(Some(DEFAULT_TAB_ID.into()), 7, "pane-X".into());
+        assert_eq!(fix_target_pane(&app), "", "stale prompt_id must not patch");
+
+        // An empty pane id is a no-op.
+        app.apply_autofix_target_resolved(Some(DEFAULT_TAB_ID.into()), 42, String::new());
+        assert_eq!(fix_target_pane(&app), "", "empty pane id is ignored");
+
+        // The matching prompt id binds the resolved working pane.
+        app.apply_autofix_target_resolved(Some(DEFAULT_TAB_ID.into()), 42, "pane-7".into());
+        assert_eq!(fix_target_pane(&app), "pane-7", "matching id binds the pane");
     }
 
     #[test]

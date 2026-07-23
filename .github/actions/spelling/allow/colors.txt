@@ -28,6 +28,7 @@ darkturquoise
 darkviolet
 deeppink
 deepskyblue
+denim
 dimgray
 dimgrey
 dodgerblue
@@ -90,6 +91,7 @@ rosybrown
 royalblue
 saddlebrown
 sandybrown
+sapphire
 seagreen
 sienna
 skyblue
@@ -98,6 +100,7 @@ slategray
 slategrey
 springgreen
 steelblue
+turquoiseblue
 violetred
 webgray
 webgreen

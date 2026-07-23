@@ -17,7 +17,7 @@ body:
     description: |
       You can copy the version number from the About dialog. Open the About dialog by opening the menu with the "V" button (to the right of the "+" button that opens a new tab) and choosing About from the end of the list.
   validations:
-    required: false
+    required: true
     
 - type: input
   attributes:
@@ -25,6 +25,21 @@ body:
     placeholder: "10.0.22621.0"
     description: |
       Please run `ver` or `[Environment]::OSVersion`.
+  validations:
+    required: false
+
+- type: dropdown
+  attributes:
+    label: Terminal Profile
+    description: Which terminal profile were you using when the issue occurred?
+    options:
+      - PowerShell
+      - Windows PowerShell
+      - Command Prompt
+      - WSL
+      - Git Bash
+      - Azure Cloud Shell
+      - Other
   validations:
     required: false
 
@@ -46,6 +61,17 @@ body:
   validations:
     required: true
 
+- type: dropdown
+  attributes:
+    label: Reproducibility
+    description: Does this happen consistently?
+    options:
+      - Always
+      - Sometimes
+      - Only once
+  validations:
+    required: fa
+
 - type: textarea
   attributes:
     label: Expected Behavior
@@ -56,7 +82,7 @@ body:
 
 - type: textarea
   attributes:
-    label: Actual Behavior
+    label: Describe what actually happened. Include any error messages or screenshots if applicable.
     placeholder: What happened instead?
   validations:
     required: true
